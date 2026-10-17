@@ -176,10 +176,10 @@ def admin_cmd(func):
         if not m or not u:
             return
         if chat.type not in GROUPS:
-            await m.reply_text("ये कमांड सिर्फ ग्रुप में चलती है।")
+            await m.reply_text("This command works only in groups.")
             return
         if not await is_admin(context, chat.id, u.id, m):
-            await m.reply_text("❌ ये कमांड सिर्फ एडमिन के लिए है।")
+            await m.reply_text("❌ This command is for admins only.")
             return
         return await func(update, context)
     return wrapper
@@ -189,7 +189,7 @@ def group_only(func):
     @functools.wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.effective_chat.type not in GROUPS:
-            await update.effective_message.reply_text("ये कमांड सिर्फ ग्रुप में चलती है।")
+            await update.effective_message.reply_text("This command works only in groups.")
             return
         return await func(update, context)
     return wrapper
@@ -223,10 +223,10 @@ async def prep(update, context, usage, protect=True):
         return None
     if protect:
         if uid == context.bot.id:
-            await m.reply_text("मैं खुद पर ये नहीं कर सकता 🙂")
+            await m.reply_text("I can't do that to myself 🙂")
             return None
         if await is_admin(context, m.chat_id, uid):
-            await m.reply_text("❌ एडमिन पर ये नहीं चलेगा।")
+            await m.reply_text("❌ This does not work on admins.")
             return None
     return uid, u, args
 
@@ -276,7 +276,7 @@ types: link sticker photo video document voice gif forward contact poll
 
 async def start(update, context):
     m = update.effective_message
-    await say(m, "👋 मैं एक ग्रुप मैनेजमेंट बॉट हूँ। मुझे ग्रुप में <b>एडमिन</b> बनाओ (Delete messages, Ban users का अधिकार) और /help देखो।")
+    await say(m, "👋 I am a group management bot. Make me an <b>admin</b> in your group (with Delete messages and Ban users rights) and check /help.")
 
 
 async def help_cmd(update, context):
@@ -321,7 +321,7 @@ async def admins(update, context):
 
 # ----------------------------------------------------------------- moderation
 async def _fail(m, e):
-    await m.reply_text(f"❌ नहीं हो पाया: {e}\n(बॉट को एडमिन + ज़रूरी अधिकार दो)")
+    await m.reply_text(f"❌ Failed: {e}\n(Make the bot admin and give it the required rights)")
 
 
 @admin_cmd
@@ -420,7 +420,7 @@ async def warn(update, context):
         await store.save(m.chat_id)
         try:
             await context.bot.ban_chat_member(m.chat_id, uid)
-            await say(m, f"🚫 {who(uid, u)} को {lim}/{lim} warns मिले — Banned.")
+            await say(m, f"🚫 {who(uid, u)} reached {lim}/{lim} warns and was banned.")
         except Exception as e:
             await _fail(m, e)
         return
@@ -443,7 +443,7 @@ async def unwarn(update, context):
     else:
         doc["warns"][str(uid)] = n - 1
     await store.save(m.chat_id)
-    await say(m, f"✅ {who(uid, u)} का एक warn हटाया।")
+    await say(m, f"✅ Removed one warn from {who(uid, u)}.")
 
 
 @group_only
@@ -467,7 +467,7 @@ async def resetwarns(update, context):
     doc = await store.get(m.chat_id)
     doc["warns"].pop(str(uid), None)
     await store.save(m.chat_id)
-    await say(m, f"✅ {who(uid, u)} के सारे warns reset।")
+    await say(m, f"✅ All warns reset for {who(uid, u)}.")
 
 
 @admin_cmd
@@ -487,7 +487,7 @@ async def setwarnlimit(update, context):
 async def del_cmd(update, context):
     m = update.effective_message
     if not m.reply_to_message:
-        await m.reply_text("जिस मैसेज को हटाना है उस पर reply करके /del लिखो।")
+        await m.reply_text("Reply to the message you want to delete with /del.")
         return
     try:
         await m.reply_to_message.delete()
@@ -500,7 +500,7 @@ async def del_cmd(update, context):
 async def purge(update, context):
     m = update.effective_message
     if not m.reply_to_message:
-        await m.reply_text("जहाँ से हटाना शुरू करना है उस मैसेज पर reply करके /purge लिखो।")
+        await m.reply_text("Reply to the message you want to purge from with /purge.")
         return
     ids = list(range(m.reply_to_message.message_id, m.message_id + 1))
     try:
@@ -516,7 +516,7 @@ async def purge(update, context):
 async def pin(update, context):
     m = update.effective_message
     if not m.reply_to_message:
-        await m.reply_text("जिसे pin करना है उस पर reply करो।")
+        await m.reply_text("Reply to the message you want to pin.")
         return
     try:
         await m.reply_to_message.pin()
@@ -611,7 +611,7 @@ async def on_leave(update, context):
 async def rules(update, context):
     m = update.effective_message
     doc = await store.get(m.chat_id)
-    await say(m, "📜 <b>Rules</b>\n" + esc(doc["rules"]) if doc["rules"] else "अभी कोई rules सेट नहीं हैं।")
+    await say(m, "📜 <b>Rules</b>\n" + esc(doc["rules"]) if doc["rules"] else "No rules have been set yet.")
 
 
 @admin_cmd
@@ -657,7 +657,7 @@ async def save(update, context):
     text = parts[2] if len(parts) > 2 else (
         (m.reply_to_message.text or m.reply_to_message.caption or "") if m.reply_to_message else "")
     if not text:
-        await m.reply_text("Note ka text भी दो।")
+        await m.reply_text("Please give the note text too.")
         return
     doc = await store.get(m.chat_id)
     doc["notes"][context.args[0].lower()] = text
@@ -673,7 +673,7 @@ async def get_note(update, context):
         return
     doc = await store.get(m.chat_id)
     t = doc["notes"].get(context.args[0].lower())
-    await (say(m, esc(t)) if t else m.reply_text("ऐसा कोई note नहीं।"))
+    await (say(m, esc(t)) if t else m.reply_text("No such note."))
 
 
 @group_only
@@ -681,7 +681,7 @@ async def notes_cmd(update, context):
     doc = await store.get(update.effective_chat.id)
     n = sorted(doc["notes"])
     await say(update.effective_message,
-              "<b>Notes</b>\n" + "\n".join(f"• #{esc(x)}" for x in n) if n else "कोई notes नहीं हैं।")
+              "<b>Notes</b>\n" + "\n".join(f"• #{esc(x)}" for x in n) if n else "No notes saved.")
 
 
 @admin_cmd
@@ -692,7 +692,7 @@ async def clear_note(update, context):
         await store.save(m.chat_id)
         await m.reply_text("✅ Note deleted.")
     else:
-        await m.reply_text("Usage: /clear <name>  (note मिला नहीं)")
+        await m.reply_text("Usage: /clear <name>  (note not found)")
 
 
 @admin_cmd
@@ -705,7 +705,7 @@ async def filter_cmd(update, context):
     reply = parts[2] if len(parts) > 2 else (
         (m.reply_to_message.text or "") if m.reply_to_message else "")
     if not reply:
-        await m.reply_text("Reply text भी दो।")
+        await m.reply_text("Please give the reply text too.")
         return
     kw = parts[1].lower()
     doc = await store.get(m.chat_id)
@@ -725,7 +725,7 @@ async def stop_filter(update, context):
     before = len(doc["filters"])
     doc["filters"] = [f for f in doc["filters"] if f["k"] != kw]
     await store.save(m.chat_id)
-    await m.reply_text("✅ Removed." if len(doc["filters"]) < before else "ऐसा filter नहीं मिला।")
+    await m.reply_text("✅ Removed." if len(doc["filters"]) < before else "No such filter.")
 
 
 @group_only
@@ -733,7 +733,7 @@ async def filters_cmd(update, context):
     doc = await store.get(update.effective_chat.id)
     f = [x["k"] for x in doc["filters"]]
     await say(update.effective_message,
-              "<b>Filters</b>\n" + "\n".join(f"• {esc(x)}" for x in f) if f else "कोई filters नहीं हैं।")
+              "<b>Filters</b>\n" + "\n".join(f"• {esc(x)}" for x in f) if f else "No filters set.")
 
 
 @admin_cmd
@@ -760,7 +760,7 @@ async def rmbl(update, context):
         await store.save(m.chat_id)
         await m.reply_text("✅ Removed.")
     else:
-        await m.reply_text("Usage: /unblacklist <word>  (word मिला नहीं)")
+        await m.reply_text("Usage: /unblacklist <word>  (word not found)")
 
 
 @group_only
@@ -768,7 +768,7 @@ async def bl_list(update, context):
     doc = await store.get(update.effective_chat.id)
     await say(update.effective_message,
               "<b>Blacklist</b>\n" + "\n".join(f"• {esc(x)}" for x in doc["blacklist"])
-              if doc["blacklist"] else "Blacklist खाली है।")
+              if doc["blacklist"] else "Blacklist is empty.")
 
 
 # ----------------------------------------------------------------- locks / flood
@@ -823,7 +823,7 @@ lock_cmd, unlock_cmd = make_lock(True), make_lock(False)
 async def locks_cmd(update, context):
     doc = await store.get(update.effective_chat.id)
     await update.effective_message.reply_text(
-        "🔒 Locked: " + (", ".join(doc["locks"]) if doc["locks"] else "कुछ नहीं"))
+        "🔒 Locked: " + (", ".join(doc["locks"]) if doc["locks"] else "none"))
 
 
 @admin_cmd
@@ -831,7 +831,7 @@ async def setflood(update, context):
     m = update.effective_message
     a = context.args
     if not a or not a[0].isdigit():
-        await m.reply_text("Usage: /setflood 6  (5 सेकंड में 6 मैसेज पर mute; 0 = off)")
+        await m.reply_text("Usage: /setflood 6  (mute after 6 messages in 5 seconds; 0 = off)")
         return
     doc = await store.get(m.chat_id)
     doc["flood"] = int(a[0])
@@ -909,7 +909,7 @@ async def setwrong(update, context):
     txt = rest(m) or (m.reply_to_message.text if m.reply_to_message and m.reply_to_message.text else "")
     if not txt:
         await m.reply_text("Usage: /setwrong <message>\nPlaceholders: {mention} {first} {id} {username} {chat} {commands}\n"
-                           "{commands} नहीं लिखोगे तो commands अपने आप नीचे जुड़ जाएंगे।")
+                           "If you do not write {commands}, your commands list is added at the bottom automatically.")
         return
     doc = await store.get(m.chat_id)
     doc["fmt"]["msg"] = txt
@@ -936,7 +936,7 @@ async def delcmd(update, context):
     doc = await store.get(m.chat_id)
     a = context.args
     if not a or not a[0].isdigit() or not (1 <= int(a[0]) <= len(doc["fmt"]["cmds"])):
-        await m.reply_text("Usage: /delcmd <number>  (नंबर /cmds से देखो)")
+        await m.reply_text("Usage: /delcmd <number>  (see numbers in /cmds)")
         return
     doc["fmt"]["cmds"].pop(int(a[0]) - 1)
     await store.save(m.chat_id)
@@ -948,7 +948,7 @@ async def setcmds(update, context):
     m = update.effective_message
     lines = [x.strip() for x in rest(m).splitlines() if x.strip()]
     if not lines:
-        await m.reply_text("Usage:\n/setcmds /like region uid - free likes\n/info uid - player info\n(हर लाइन एक command)")
+        await m.reply_text("Usage:\n/setcmds /like region uid - free likes\n/info uid - player info\n(one command per line)")
         return
     doc = await store.get(m.chat_id)
     doc["fmt"]["cmds"] = lines
@@ -969,7 +969,7 @@ async def cmds_cmd(update, context):
     doc = await store.get(update.effective_chat.id)
     c = doc["fmt"]["cmds"]
     await update.effective_message.reply_text(
-        "\n".join(f"{i}. {x}" for i, x in enumerate(c, 1)) if c else "कोई command सेट नहीं है। /addcmd या /setcmds से जोड़ो।")
+        "\n".join(f"{i}. {x}" for i, x in enumerate(c, 1)) if c else "No commands set. Add them with /addcmd or /setcmds.")
 
 
 @admin_cmd
@@ -989,7 +989,7 @@ async def setrange(update, context):
 async def formatmode(update, context):
     m = update.effective_message
     if not context.args or context.args[0].lower() not in ("pure", "contains"):
-        await m.reply_text("Usage: /formatmode pure|contains\npure = सिर्फ नंबर वाला मैसेज\ncontains = मैसेज में कहीं भी नंबर")
+        await m.reply_text("Usage: /formatmode pure|contains\npure = message that is only a number\ncontains = number anywhere in the message")
         return
     doc = await store.get(m.chat_id)
     doc["fmt"]["mode"] = context.args[0].lower()
@@ -1021,7 +1021,7 @@ async def formatautodel(update, context):
     m = update.effective_message
     a = context.args
     if not a or not a[0].isdigit():
-        await m.reply_text("Usage: /formatautodel 15  (सेकंड, 0 = मैसेज रहने दो)")
+        await m.reply_text("Usage: /formatautodel 15  (seconds, 0 = keep the message)")
         return
     doc = await store.get(m.chat_id)
     doc["fmt"]["autodel"] = int(a[0])
@@ -1093,7 +1093,7 @@ async def watcher(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.restrict_chat_member(
                     chat.id, user.id, ChatPermissions(can_send_messages=False),
                     until_date=datetime.now(timezone.utc) + timedelta(minutes=5))
-                await say(m, f"🌊 Flood! {mention(user)} 5 मिनट के लिए mute।")
+                await say(m, f"🌊 Flood! {mention(user)} muted for 5 minutes.")
             except Exception:
                 pass
             return
