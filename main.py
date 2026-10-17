@@ -157,8 +157,8 @@ def parse_dur(s):
     return int(mt[1]) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[mt[2]]
 
 
-async def is_admin(context, chat_id, user_id, msg=None):
-    if user_id == OWNER_ID or user_id == ANON_ADMIN_BOT:
+async def is_admin(context, chat_id, user_id, msg=None, owner_bypass=True):
+    if user_id == ANON_ADMIN_BOT or (owner_bypass and user_id == OWNER_ID):
         return True
     if msg is not None and msg.sender_chat and msg.sender_chat.id == chat_id:
         return True
@@ -183,6 +183,47 @@ def admin_cmd(func):
             return
         return await func(update, context)
     return wrapper
+
+
+GLOBAL = 0   # global settings doc (Wrong Format guard), set by owner in private chat
+
+
+def owner_dm(func):
+    """Owner-only, private-chat-only commands (all customisation happens here)."""
+    @functools.wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        chat, m, u = update.effective_chat, update.effective_message, update.effective_user
+        if not m or not u:
+            return
+        if u.id != OWNER_ID:
+            if chat.type == ChatType.PRIVATE:
+                await m.reply_text("🔒 This is a private bot.")
+            return
+        if chat.type != ChatType.PRIVATE:
+            try:
+                await m.delete()
+            except Exception:
+                pass
+            await context.bot.send_message(chat.id, "🔒 Send this command to me in private chat, not in the group.")
+            return
+        return await func(update, context)
+    return wrapper
+
+
+_bot_admin_cache = {}
+
+
+async def bot_is_admin(context, chat_id):
+    ts, val = _bot_admin_cache.get(chat_id, (0, False))
+    if time.time() - ts < 300:
+        return val
+    try:
+        cm = await context.bot.get_chat_member(chat_id, context.bot.id)
+        val = cm.status in ("administrator", "creator")
+    except Exception:
+        val = False
+    _bot_admin_cache[chat_id] = (time.time(), val)
+    return val
 
 
 def group_only(func):
@@ -263,24 +304,55 @@ Placeholders: {mention} {first} {id} {username} {chat}
 types: link sticker photo video document voice gif forward contact poll
 /setflood &lt;n&gt; (0 = off)
 
-<b>🔢 Wrong Format Guard (number blocker)</b>
+<i>Wrong Format Guard is configured by the owner in private chat.</i>"""
+
+
+OWNER_HELP = """<b>🔒 Owner Panel (private chat only)</b>
+
+These settings apply to <b>every group where this bot is admin</b>.
+
+<b>🔢 Wrong Format Guard</b>
 /setformat on|off
 /setwrong &lt;message&gt;
-/addcmd &lt;line&gt; /delcmd &lt;no&gt; /setcmds &lt;lines&gt; /clearcmds /cmds
+/addcmd &lt;line&gt;  /delcmd &lt;no&gt;  /setcmds &lt;lines&gt;  /clearcmds  /cmds
 /setrange &lt;min&gt; &lt;max&gt;  (default 7 12)
 /formatmode pure|contains
-/formatadmin on|off (admins ko chhoot)
-/formatdelete on|off /formatautodel &lt;sec&gt;
-/formatstatus"""
+/formatadmin on|off  (exempt group admins)
+/formatdelete on|off
+/formatautodel &lt;sec&gt;  (0 = keep reply)
+/formatstatus
+
+Placeholders for /setwrong: {mention} {first} {id} {username} {chat} {commands}
+
+<b>Example</b>
+/setwrong ❌ Wrong Format! Use only these commands:
+/setcmds /like region uid - free likes
+/info uid - player info
+/setformat on
+
+Group moderation commands (ban, mute, warn, locks, notes...) are used inside groups. Send /help in a group to see them."""
 
 
 async def start(update, context):
     m = update.effective_message
+    if update.effective_chat.type == ChatType.PRIVATE:
+        if update.effective_user.id == OWNER_ID:
+            await say(m, OWNER_HELP)
+        else:
+            await m.reply_text("🔒 This is a private bot.")
+        return
     await say(m, "👋 I am a group management bot. Make me an <b>admin</b> in your group (with Delete messages and Ban users rights) and check /help.")
 
 
 async def help_cmd(update, context):
-    await say(update.effective_message, HELP)
+    m = update.effective_message
+    if update.effective_chat.type == ChatType.PRIVATE:
+        if update.effective_user.id == OWNER_ID:
+            await say(m, OWNER_HELP)
+        else:
+            await m.reply_text("🔒 This is a private bot.")
+        return
+    await say(m, HELP)
 
 
 async def ping(update, context):
@@ -890,20 +962,20 @@ async def punish_format(update, context, doc):
         log.exception("format reply failed")
 
 
-@admin_cmd
+@owner_dm
 async def setformat(update, context):
     m = update.effective_message
     v = _toggle_arg(context.args)
     if v is None:
         await m.reply_text("Usage: /setformat on|off")
         return
-    doc = await store.get(m.chat_id)
+    doc = await store.get(GLOBAL)
     doc["fmt"]["on"] = v
-    await store.save(m.chat_id)
+    await store.save(GLOBAL)
     await m.reply_text(f"✅ Wrong Format guard {'ON ✅' if v else 'OFF ⛔'}")
 
 
-@admin_cmd
+@owner_dm
 async def setwrong(update, context):
     m = update.effective_message
     txt = rest(m) or (m.reply_to_message.text if m.reply_to_message and m.reply_to_message.text else "")
@@ -911,103 +983,103 @@ async def setwrong(update, context):
         await m.reply_text("Usage: /setwrong <message>\nPlaceholders: {mention} {first} {id} {username} {chat} {commands}\n"
                            "If you do not write {commands}, your commands list is added at the bottom automatically.")
         return
-    doc = await store.get(m.chat_id)
+    doc = await store.get(GLOBAL)
     doc["fmt"]["msg"] = txt
-    await store.save(m.chat_id)
+    await store.save(GLOBAL)
     await m.reply_text("✅ Wrong Format message set.")
 
 
-@admin_cmd
+@owner_dm
 async def addcmd(update, context):
     m = update.effective_message
     line = rest(m)
     if not line:
         await m.reply_text("Usage: /addcmd /like region uid - free likes")
         return
-    doc = await store.get(m.chat_id)
+    doc = await store.get(GLOBAL)
     doc["fmt"]["cmds"].append(line)
-    await store.save(m.chat_id)
+    await store.save(GLOBAL)
     await m.reply_text(f"✅ Added (#{len(doc['fmt']['cmds'])})")
 
 
-@admin_cmd
+@owner_dm
 async def delcmd(update, context):
     m = update.effective_message
-    doc = await store.get(m.chat_id)
+    doc = await store.get(GLOBAL)
     a = context.args
     if not a or not a[0].isdigit() or not (1 <= int(a[0]) <= len(doc["fmt"]["cmds"])):
         await m.reply_text("Usage: /delcmd <number>  (see numbers in /cmds)")
         return
     doc["fmt"]["cmds"].pop(int(a[0]) - 1)
-    await store.save(m.chat_id)
+    await store.save(GLOBAL)
     await m.reply_text("✅ Removed.")
 
 
-@admin_cmd
+@owner_dm
 async def setcmds(update, context):
     m = update.effective_message
     lines = [x.strip() for x in rest(m).splitlines() if x.strip()]
     if not lines:
         await m.reply_text("Usage:\n/setcmds /like region uid - free likes\n/info uid - player info\n(one command per line)")
         return
-    doc = await store.get(m.chat_id)
+    doc = await store.get(GLOBAL)
     doc["fmt"]["cmds"] = lines
-    await store.save(m.chat_id)
+    await store.save(GLOBAL)
     await m.reply_text(f"✅ {len(lines)} commands set.")
 
 
-@admin_cmd
+@owner_dm
 async def clearcmds(update, context):
-    doc = await store.get(update.effective_chat.id)
+    doc = await store.get(GLOBAL)
     doc["fmt"]["cmds"] = []
-    await store.save(update.effective_chat.id)
+    await store.save(GLOBAL)
     await update.effective_message.reply_text("✅ Commands list cleared.")
 
 
-@admin_cmd
+@owner_dm
 async def cmds_cmd(update, context):
-    doc = await store.get(update.effective_chat.id)
+    doc = await store.get(GLOBAL)
     c = doc["fmt"]["cmds"]
     await update.effective_message.reply_text(
         "\n".join(f"{i}. {x}" for i, x in enumerate(c, 1)) if c else "No commands set. Add them with /addcmd or /setcmds.")
 
 
-@admin_cmd
+@owner_dm
 async def setrange(update, context):
     m = update.effective_message
     a = context.args
     if len(a) != 2 or not all(x.isdigit() for x in a) or not (1 <= int(a[0]) <= int(a[1]) <= 40):
         await m.reply_text("Usage: /setrange 7 12")
         return
-    doc = await store.get(m.chat_id)
+    doc = await store.get(GLOBAL)
     doc["fmt"]["min"], doc["fmt"]["max"] = int(a[0]), int(a[1])
-    await store.save(m.chat_id)
+    await store.save(GLOBAL)
     await m.reply_text(f"✅ Range: {a[0]}–{a[1]} digits")
 
 
-@admin_cmd
+@owner_dm
 async def formatmode(update, context):
     m = update.effective_message
     if not context.args or context.args[0].lower() not in ("pure", "contains"):
         await m.reply_text("Usage: /formatmode pure|contains\npure = message that is only a number\ncontains = number anywhere in the message")
         return
-    doc = await store.get(m.chat_id)
+    doc = await store.get(GLOBAL)
     doc["fmt"]["mode"] = context.args[0].lower()
-    await store.save(m.chat_id)
+    await store.save(GLOBAL)
     await m.reply_text(f"✅ Mode: {context.args[0].lower()}")
 
 
 def make_fmt_flag(cmd, key, label):
-    @admin_cmd
+    @owner_dm
     async def flag(update, context):
         m = update.effective_message
         v = _toggle_arg(context.args)
         if v is None:
             await m.reply_text(f"Usage: /{cmd} on|off")
             return
-        doc = await store.get(m.chat_id)
+        doc = await store.get(GLOBAL)
         doc["fmt"][key] = v
-        await store.save(m.chat_id)
+        await store.save(GLOBAL)
         await m.reply_text(f"✅ {label}: {'ON' if v else 'OFF'}")
     return flag
 
@@ -1016,22 +1088,22 @@ formatadmin = make_fmt_flag("formatadmin", "exempt_admins", "Admins exempt")
 formatdelete = make_fmt_flag("formatdelete", "delete_msg", "Delete user's number message")
 
 
-@admin_cmd
+@owner_dm
 async def formatautodel(update, context):
     m = update.effective_message
     a = context.args
     if not a or not a[0].isdigit():
         await m.reply_text("Usage: /formatautodel 15  (seconds, 0 = keep the message)")
         return
-    doc = await store.get(m.chat_id)
+    doc = await store.get(GLOBAL)
     doc["fmt"]["autodel"] = int(a[0])
-    await store.save(m.chat_id)
+    await store.save(GLOBAL)
     await m.reply_text(f"✅ Auto-delete: {a[0]}s")
 
 
-@admin_cmd
+@owner_dm
 async def formatstatus(update, context):
-    doc = await store.get(update.effective_chat.id)
+    doc = await store.get(GLOBAL)
     f = doc["fmt"]
     t = (f"<b>🔢 Wrong Format Guard</b>\n"
          f"Status: {'ON ✅' if f['on'] else 'OFF ⛔'}\n"
@@ -1055,10 +1127,11 @@ async def watcher(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await is_admin(context, chat.id, user.id, m)
 
     # 1) Wrong Format guard
-    f = doc["fmt"]
-    if f["on"] and text and bad_number(text, f):
-        if not (f["exempt_admins"] and await admin()):
-            await punish_format(update, context, doc)
+    gdoc = await store.get(GLOBAL)
+    f = gdoc["fmt"]
+    if f["on"] and text and bad_number(text, f) and await bot_is_admin(context, chat.id):
+        if not (f["exempt_admins"] and await is_admin(context, chat.id, user.id, m, owner_bypass=False)):
+            await punish_format(update, context, gdoc)
             return
 
     # 2) locks
