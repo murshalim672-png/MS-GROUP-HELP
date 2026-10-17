@@ -1146,6 +1146,7 @@ def main():
     threading.Thread(target=run_web, daemon=True).start()
     log.info("Storage: %s", "MongoDB" if store.uri else "local data.json")
 
+    asyncio.set_event_loop(asyncio.new_event_loop())   # Python 3.14 fix
     app = Application.builder().token(token).build()
     C = lambda name, fn: app.add_handler(CommandHandler(name, fn))
     for name, fn in [
