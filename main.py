@@ -24,6 +24,7 @@ VALID_STYLES = {"success", "primary", "danger"}      # green / blue / red
 COLOR_LABELS = {"success": "🟢 GREEN", "primary": "🔵 BLUE", "danger": "🔴 RED"}
 COLOR_CODES = {"g": "success", "b": "primary", "r": "danger"}
 MAX_CHANNELS = 10
+MAX_GROUPS = 10
 
 # Channel buttons are FIXED: always BLUE (primary), name is automatic
 # "𝗝𝗢𝗜𝗡 𝗖𝗛𝗔𝗡𝗡𝗘𝗟 𝟭", "𝗝𝗢𝗜𝗡 𝗖𝗛𝗔𝗡𝗡𝗘𝗟 𝟮" ... and cannot be edited from /admin.
@@ -121,6 +122,7 @@ def sc(text, html=True):
 GROUP_DEFAULTS = {
     "gate": True,                       # join gate ON/OFF for this group
     "channels": [],                     # required channels: [{"id","link","chat"}]
+    "required_groups": [],              # required groups: [{"id","link","chat"}]
     "verify_text": DEFAULT_VERIFY_TEXT,
     "verify_color": "success",
     "verify_icon": "",                  # premium emoji id on the VERIFY button ("" = none)
@@ -379,33 +381,57 @@ async def missing_channels(bot, g, user_id):
     return out
 
 
+async def missing_required_groups(bot, g, user_id):
+    if user_id == OWNER_ID:
+        return []
+    out = []
+    for item in g.get("required_groups", []):
+        if item.get("chat") and not await is_member_of(bot, item["chat"], user_id):
+            out.append(item)
+    return out
+
+
+async def all_missing_requirements(bot, g, user_id):
+    return await missing_channels(bot, g, user_id), await missing_required_groups(bot, g, user_id)
+
+
+
 def verify_button(g, user_id, use_icon=True):
     return btn(g["verify_text"], data=f"v:{user_id}", style=g["verify_color"],
                icon=(g.get("verify_icon") if use_icon else ""))
 
 
-def join_markup(g, user_id, missing, use_icon=True):
-    """Only the channels this user has NOT joined, numbered 1, 2, 3... + VERIFY (bound to the user)."""
-    rows = [[btn(channel_button_name(n), url=ch["link"], style=CHANNEL_BUTTON_STYLE)]
-            for n, ch in enumerate(missing, 1)]
+def group_button_name(number):
+    return _sans_bold(f"JOIN GROUP {number}")
+
+
+def join_markup(g, user_id, missing, missing_groups=None, use_icon=True):
+    missing_groups = missing_groups or []
+    rows = []
+    for ch in missing:
+        n = next((i for i, x in enumerate(g["channels"], 1) if x["id"] == ch["id"]), 1)
+        rows.append([btn(channel_button_name(n), url=ch["link"], style="primary")])
+    for item in missing_groups:
+        n = next((i for i, x in enumerate(g.get("required_groups", []), 1) if x["id"] == item["id"]), 1)
+        rows.append([btn(group_button_name(n), url=item["link"], style="primary")])
     rows.append([verify_button(g, user_id, use_icon)])
     return InlineKeyboardMarkup(rows)
 
 
-async def send_join_prompt(bot, chat_id, g, user, missing):
-    text = (f"👋 Hello {name_text(user)}\n\n"
-            "⚠️ You must join all required channels to use this group\n\n"
-            "👇 Join the channels below, then tap Verify")
+async def send_join_prompt(bot, chat_id, g, user, missing, missing_groups=None):
+    missing_groups = missing_groups or []
+    text = (f"👋 Hello {name_text(user)}\\n\\n"
+            "⚠️ You must join all required channels/groups to use this group\\n\\n"
+            "👇 Join the buttons below, then tap Verify")
     try:
         return await bot.send_message(chat_id, text, parse_mode="HTML",
-                                      reply_markup=join_markup(g, user.id, missing))
+                                      reply_markup=join_markup(g, user.id, missing, missing_groups))
     except BadRequest as e:
         if not g.get("verify_icon"):
             raise
-        # Premium emoji icon refused by Telegram: fall back to a normal VERIFY button.
         log.warning("Join prompt failed with premium icon, retrying without it: %s", e)
         return await bot.send_message(chat_id, text, parse_mode="HTML",
-                                      reply_markup=join_markup(g, user.id, missing, use_icon=False))
+                                      reply_markup=join_markup(g, user.id, missing, missing_groups, use_icon=False))
 
 
 async def gate_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -414,14 +440,14 @@ async def gate_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not m or not user or user.is_bot or m.sender_chat or getattr(m, "is_automatic_forward", False):
         return
     g = db.groups.get(str(chat.id))
-    if not g or not g["gate"] or not g["channels"] or user.id == OWNER_ID:
+    if not g or not g["gate"] or not (g["channels"] or g.get("required_groups")) or user.id == OWNER_ID:
         return
     if time.time() - joined_cache.get((chat.id, user.id), 0) < JOINED_CACHE_SECONDS:
         return
     if not await bot_is_admin(context.bot, chat.id):
         return
-    missing = await missing_channels(context.bot, g, user.id)
-    if not missing:
+    missing, missing_groups = await all_missing_requirements(context.bot, g, user.id)
+    if not missing and not missing_groups:
         joined_cache[(chat.id, user.id)] = time.time()
         return
     try:     # group admins are never blocked
@@ -439,7 +465,7 @@ async def gate_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if old and time.time() - old[1] < PROMPT_SECONDS:
         return        # this user already has a join message waiting
     try:
-        sent = await send_join_prompt(context.bot, chat.id, g, user, missing)
+        sent = await send_join_prompt(context.bot, chat.id, g, user, missing, missing_groups)
         prompts[(chat.id, user.id)] = (sent.message_id, time.time())
     except Exception:
         log.exception("could not send join prompt")
@@ -461,15 +487,15 @@ async def on_verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer()
         return
     joined_cache.pop((chat_id, target), None)
-    missing = await missing_channels(context.bot, g, target)
-    if missing:
+    missing, missing_groups = await all_missing_requirements(context.bot, g, target)
+    if missing or missing_groups:
         try:
             try:
-                await q.edit_message_reply_markup(reply_markup=join_markup(g, target, missing))
+                await q.edit_message_reply_markup(reply_markup=join_markup(g, target, missing, missing_groups))
             except BadRequest as e:
                 if "not modified" in str(e).lower() or not g.get("verify_icon"):
                     raise
-                await q.edit_message_reply_markup(reply_markup=join_markup(g, target, missing, use_icon=False))
+                await q.edit_message_reply_markup(reply_markup=join_markup(g, target, missing, missing_groups, use_icon=False))
         except BadRequest as e:
             if "not modified" not in str(e).lower():
                 log.warning("Verify refresh failed: %s", e)
@@ -604,6 +630,7 @@ async def group_panel(bot, gid):
     m = InlineKeyboardMarkup([
         [btn(f"🔒 Join Gate: {onoff(g['gate'])}", data=f"gt:{gid}", style="success" if g["gate"] else "danger")],
         [btn("📢 Required Channels", data=f"gc:{gid}", style="primary")],
+        [btn("👥 Required Groups", data=f"gg:{gid}", style="primary")],
         [btn("✅ Verify Button", data=f"gv:{gid}", style="success")],
         [btn(f"🗑 Delete Unjoined Msg: {onoff(g['delete_msg'])}", data=f"gm:{gid}")],
         [btn("✏️ Change Group", data=f"ge:{gid}", style="primary"), btn("🗑 Delete Group", data=f"gd:{gid}", style="danger")],
@@ -632,6 +659,44 @@ def channels_panel(gid):
         rows.append([btn("➕ Add Channel", data=f"gca:{gid}", style="success")])
     rows.append([btn("⬅️ Back", data=f"g:{gid}")])
     return text, InlineKeyboardMarkup(rows)
+
+
+def required_groups_panel(gid):
+    g = db.groups.get(gid)
+    if not g:
+        return main_panel()
+    items = g.get("required_groups", [])
+    lines = "\\n".join(f"{i}. {group_button_name(i)} — <code>{escape(x['chat'] or '-')}</code>"
+                       for i, x in enumerate(items, 1)) if items else "No required groups added yet."
+    text = (f"👥 <b>Required Groups</b>\\n{escape(g['title'])}\\n"
+            "Users must join every listed group before messaging. The bot must be in each required group (admin recommended).\\n\\n" + lines)
+    rows = [[btn("👥 " + group_button_name(i), data=f"gr:{gid}:{x['id']}", style="primary")]
+            for i, x in enumerate(items, 1)]
+    if len(items) < MAX_GROUPS:
+        rows.append([btn("➕ Add Group Requirement", data=f"gra:{gid}", style="success")])
+    rows.append([btn("⬅️ Back", data=f"g:{gid}")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+def required_group_panel(gid, rid):
+    items = db.groups.get(gid, {}).get("required_groups", [])
+    item = next((x for x in items if x["id"] == rid), None)
+    if not item:
+        return required_groups_panel(gid)
+    n = next((i for i, x in enumerate(items, 1) if x["id"] == rid), 0)
+    text = (f"👥 <b>Required Group Button</b>\\n\\nName: {group_button_name(n)}\\n"
+            f"Link: <code>{escape(item['link'])}</code>\\nGroup ID: <code>{escape(item['chat'] or '-')}</code>")
+    return text, InlineKeyboardMarkup([[btn("🗑 Delete Group Requirement", data=f"grd:{gid}:{rid}", style="danger")],
+                                       [btn("⬅️ Back", data=f"gg:{gid}")] ])
+
+
+def new_required_group(gid, link, chat):
+    item = {"id": uuid.uuid4().hex[:8], "link": link, "chat": chat}
+    db.groups[gid].setdefault("required_groups", []).append(item)
+    db.save()
+    for k in [k for k in joined_cache if k[0] == int(gid)]:
+        joined_cache.pop(k, None)
+    return item
 
 
 def channel_panel(gid, cid):
@@ -771,7 +836,7 @@ async def on_owner_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ---- everything below belongs to one group: arg = group id ----
     gid = arg
     g = db.groups.get(gid)
-    if kind in ("g", "gt", "gm", "ge", "gd", "gdy", "gc", "gca", "gv", "gvt", "gvc", "gvi", "c", "cd", "cdy", "col") and not g:
+    if kind in ("g", "gt", "gm", "ge", "gd", "gdy", "gc", "gca", "gg", "gra", "gr", "grd", "gv", "gvt", "gvc", "gvi", "c", "cd", "cdy", "col") and not g:
         await show(q, await groups_panel(bot))
         return
 
@@ -824,6 +889,28 @@ async def on_owner_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for k in [k for k in joined_cache if k[0] == int(gid)]:
             joined_cache.pop(k, None)
         await show(q, channels_panel(gid), "🗑 Deleted\n\n")
+
+    # ---- required groups of this group ----
+    elif kind == "gg":
+        await show(q, required_groups_panel(gid))
+    elif kind == "gra":
+        if len(g.get("required_groups", [])) >= MAX_GROUPS:
+            await bot.send_message(chat_id, f"❌ Maximum {MAX_GROUPS} required groups allowed.")
+            return
+        sessions[uid] = {"action": "addrg", "gid": gid, "step": "link", "data": {}}
+        await bot.send_message(chat_id,
+            f"➕ <b>Add Required Group</b> for {escape(g['title'])}\\n\\n"
+            "Step 1/2: send the group's public link (https://t.me/...) or invite link.\\n"
+            "For private groups, you will also need to send the numeric group ID (-100...).",
+            parse_mode="HTML", reply_markup=cancel_markup(f"gg:{gid}"))
+    elif kind == "gr":
+        await show(q, required_group_panel(gid, arg2))
+    elif kind == "grd":
+        g["required_groups"] = [x for x in g.get("required_groups", []) if x["id"] != arg2]
+        db.save()
+        for k in [k for k in joined_cache if k[0] == int(gid)]:
+            joined_cache.pop(k, None)
+        await show(q, required_groups_panel(gid), "🗑 Deleted\\n\\n")
 
     # ---- verify button of this group ----
     elif kind == "gv":
@@ -892,6 +979,41 @@ async def handle_session(update: Update, context: ContextTypes.DEFAULT_TYPE, ses
         else:
             replace_group(sess["gid"], chat)
             await send_panel(bot, chat_id, await group_panel(bot, str(chat.id)), "✏️ Group Updated\n\n")
+        return
+
+    if action == "addrg":
+        gid = sess["gid"]
+        if gid not in db.groups:
+            done()
+            return
+        d = sess["data"]
+        if sess["step"] == "link":
+            if not valid_link(value):
+                await m.reply_text("❌ Invalid link. Use https://, http:// or tg://.")
+                return
+            d["link"] = value
+            derived = derive_chat_from_link(value)
+            if derived:
+                ok, err = await check_bot_access(bot, derived)
+                if ok:
+                    item = new_required_group(gid, value, derived)
+                    done()
+                    await send_panel(bot, chat_id, required_group_panel(gid, item["id"]), "✅ Group Requirement Added\\n\\n")
+                    return
+            sess["step"] = "chat"
+            await m.reply_text("Step 2/2: send the group's numeric ID (-100...) or @username. Make sure the bot is a member/admin there.")
+            return
+        chat = normalize_chat(value)
+        if not chat:
+            await m.reply_text("❌ Send a valid @username or numeric ID (-100...).")
+            return
+        ok, err = await check_bot_access(bot, chat)
+        if not ok:
+            await m.reply_text("❌ " + err)
+            return
+        item = new_required_group(gid, d["link"], chat)
+        done()
+        await send_panel(bot, chat_id, required_group_panel(gid, item["id"]), "✅ Group Requirement Added\\n\\n")
         return
 
     if action == "vtxt":
@@ -1052,7 +1174,7 @@ def main():
     asyncio.set_event_loop(asyncio.new_event_loop())   # Python 3.14 fix
     app = Application.builder().bot(StyledBot(token)).build()
     app.add_handler(CallbackQueryHandler(on_verify, pattern=r"^v:"))
-    app.add_handler(CallbackQueryHandler(on_owner_button, pattern=r"^(m|g|gt|gm|ge|gd|gdy|gc|gca|gv|gvt|gvc|gvi|c|cd|cdy|col|add|rch|rchg):"))
+    app.add_handler(CallbackQueryHandler(on_owner_button, pattern=r"^(m|g|gt|gm|ge|gd|gdy|gc|gca|gg|gra|gr|grd|gv|gvt|gvc|gvi|c|cd|cdy|col|add|rch|rchg):"))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE, on_private_message))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.StatusUpdate.ALL, gate_watch), group=1)
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
