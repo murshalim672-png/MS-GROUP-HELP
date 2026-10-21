@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """Private group-help bot (owner only, button controlled).
  - Owner manages groups (add / change / delete) with buttons in the bot DM.
- - REQUIRED CHANNELS join gate (ported from the like-bot): JOIN CHANNEL 1, 2... + VERIFY.
+ - Every group has its OWN join requirement: required channels (JOIN CHANNEL 1, 2... + VERIFY).
  - Bot text style: first letter bold, rest small-caps (ported from the like-bot)."""
-import asyncio, html, json, logging, os, re, sys, threading, time, uuid
+import asyncio, copy, html, json, logging, os, re, sys, threading, time, uuid
 from html import escape
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -117,39 +117,45 @@ def sc(text, html=True):
 
 
 # ----------------------------------------------------------------- storage
-DEFAULT_SETTINGS = {
+# Every group has its OWN join-gate settings.
+GROUP_DEFAULTS = {
+    "gate": True,                       # join gate ON/OFF for this group
+    "channels": [],                     # required channels: [{"id","link","chat"}]
     "verify_text": DEFAULT_VERIFY_TEXT,
     "verify_color": "success",
-    "verify_icon": "",          # premium emoji id on the VERIFY button ("" = none)
-    "channels": [],             # required channels: [{"id","link","chat"}]
-    "delete_msg": True,         # delete the message of a user who has not joined
+    "verify_icon": "",                  # premium emoji id on the VERIFY button ("" = none)
+    "delete_msg": True,                 # delete the message of a user who has not joined
 }
 
 
+def group_defaults():
+    return copy.deepcopy(GROUP_DEFAULTS)
+
+
 class Store:
-    """JSON file: {"groups": {"<chat_id>": {title,type,added,gate}}, "settings": {...}}"""
+    """JSON file: {"groups": {"<chat_id>": {title, type, added, + GROUP_DEFAULTS keys}}}"""
 
     def __init__(self):
-        self.data = {"groups": {}, "settings": json.loads(json.dumps(DEFAULT_SETTINGS))}
+        self.data = {"groups": {}}
+        legacy = {}
         if os.path.exists(DATA_FILE):
             try:
                 with open(DATA_FILE, encoding="utf-8") as fh:
                     raw = json.load(fh)
                 self.data["groups"] = raw.get("groups", {})
-                self.data["settings"].update(raw.get("settings", {}))
+                legacy = raw.get("settings", {})      # older version had global settings
             except Exception:
                 log.exception("could not read data.json")
-        s = self.data["settings"]
-        if s.get("verify_color") not in VALID_STYLES:
-            s["verify_color"] = "success"
+        for g in self.data["groups"].values():
+            for k, v in GROUP_DEFAULTS.items():
+                if k not in g:
+                    g[k] = copy.deepcopy(legacy.get(k, v)) if k != "gate" else v
+            if g.get("verify_color") not in VALID_STYLES:
+                g["verify_color"] = "success"
 
     @property
     def groups(self):
         return self.data["groups"]
-
-    @property
-    def settings(self):
-        return self.data["settings"]
 
     def save(self):
         try:
@@ -346,7 +352,7 @@ async def check_bot_access(bot, chat):
                        "the bot is admin there. Send it again.")
 
 
-# ----------------------------------------------------------------- REQUIRED CHANNELS (JOIN GATE)
+# ----------------------------------------------------------------- REQUIRED CHANNELS (JOIN GATE, per group)
 async def is_member_of(bot, chat, user_id):
     try:
         target = int(chat) if str(chat).lstrip("-").isdigit() else chat
@@ -362,65 +368,61 @@ async def is_member_of(bot, chat, user_id):
     return False
 
 
-async def missing_channels(bot, user_id):
-    """Required channels this user has NOT joined yet (fresh check)."""
+async def missing_channels(bot, g, user_id):
+    """Required channels of THIS group that the user has NOT joined yet (fresh check)."""
     if user_id == OWNER_ID:
         return []
     out = []
-    for ch in db.settings["channels"]:
+    for ch in g["channels"]:
         if ch.get("chat") and not await is_member_of(bot, ch["chat"], user_id):
             out.append(ch)
     return out
 
 
-def verify_button(user_id, use_icon=True):
-    s = db.settings
-    return btn(s["verify_text"], data=f"v:{user_id}", style=s["verify_color"],
-               icon=(s.get("verify_icon") if use_icon else ""))
+def verify_button(g, user_id, use_icon=True):
+    return btn(g["verify_text"], data=f"v:{user_id}", style=g["verify_color"],
+               icon=(g.get("verify_icon") if use_icon else ""))
 
 
-def join_markup(user_id, missing, use_icon=True):
+def join_markup(g, user_id, missing, use_icon=True):
     """Only the channels this user has NOT joined, numbered 1, 2, 3... + VERIFY (bound to the user)."""
     rows = [[btn(channel_button_name(n), url=ch["link"], style=CHANNEL_BUTTON_STYLE)]
             for n, ch in enumerate(missing, 1)]
-    rows.append([verify_button(user_id, use_icon)])
+    rows.append([verify_button(g, user_id, use_icon)])
     return InlineKeyboardMarkup(rows)
 
 
-async def send_join_prompt(bot, chat_id, user, missing):
+async def send_join_prompt(bot, chat_id, g, user, missing):
     text = (f"👋 Hello {name_text(user)}\n\n"
             "⚠️ You must join all required channels to use this group\n\n"
             "👇 Join the channels below, then tap Verify")
     try:
         return await bot.send_message(chat_id, text, parse_mode="HTML",
-                                      reply_markup=join_markup(user.id, missing))
+                                      reply_markup=join_markup(g, user.id, missing))
     except BadRequest as e:
-        if not db.settings.get("verify_icon"):
+        if not g.get("verify_icon"):
             raise
         # Premium emoji icon refused by Telegram: fall back to a normal VERIFY button.
         log.warning("Join prompt failed with premium icon, retrying without it: %s", e)
         return await bot.send_message(chat_id, text, parse_mode="HTML",
-                                      reply_markup=join_markup(user.id, missing, use_icon=False))
+                                      reply_markup=join_markup(g, user.id, missing, use_icon=False))
 
 
 async def gate_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Runs on every message in the owner's groups."""
+    """Runs on every message in the owner's groups. Uses THIS group's own settings."""
     m, chat, user = update.effective_message, update.effective_chat, update.effective_user
     if not m or not user or user.is_bot or m.sender_chat or getattr(m, "is_automatic_forward", False):
         return
     g = db.groups.get(str(chat.id))
-    if not g or not g.get("gate", True):
+    if not g or not g["gate"] or not g["channels"] or user.id == OWNER_ID:
         return
-    s = db.settings
-    if not s["channels"] or user.id == OWNER_ID:
-        return
-    if time.time() - joined_cache.get(user.id, 0) < JOINED_CACHE_SECONDS:
+    if time.time() - joined_cache.get((chat.id, user.id), 0) < JOINED_CACHE_SECONDS:
         return
     if not await bot_is_admin(context.bot, chat.id):
         return
-    missing = await missing_channels(context.bot, user.id)
+    missing = await missing_channels(context.bot, g, user.id)
     if not missing:
-        joined_cache[user.id] = time.time()
+        joined_cache[(chat.id, user.id)] = time.time()
         return
     try:     # group admins are never blocked
         cm = await context.bot.get_chat_member(chat.id, user.id)
@@ -428,7 +430,7 @@ async def gate_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
     except Exception:
         pass
-    if s["delete_msg"]:
+    if g["delete_msg"]:
         try:
             await m.delete()
         except Exception:
@@ -437,7 +439,7 @@ async def gate_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if old and time.time() - old[1] < PROMPT_SECONDS:
         return        # this user already has a join message waiting
     try:
-        sent = await send_join_prompt(context.bot, chat.id, user, missing)
+        sent = await send_join_prompt(context.bot, chat.id, g, user, missing)
         prompts[(chat.id, user.id)] = (sent.message_id, time.time())
     except Exception:
         log.exception("could not send join prompt")
@@ -453,23 +455,28 @@ async def on_verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if q.from_user.id != target:       # only the user this prompt was made for
         await q.answer("❌ This button is not for you.", show_alert=True)
         return
-    joined_cache.pop(target, None)
-    missing = await missing_channels(context.bot, target)
+    chat_id = q.message.chat.id
+    g = db.groups.get(str(chat_id))
+    if not g:
+        await q.answer()
+        return
+    joined_cache.pop((chat_id, target), None)
+    missing = await missing_channels(context.bot, g, target)
     if missing:
         try:
             try:
-                await q.edit_message_reply_markup(reply_markup=join_markup(target, missing))
+                await q.edit_message_reply_markup(reply_markup=join_markup(g, target, missing))
             except BadRequest as e:
-                if "not modified" in str(e).lower() or not db.settings.get("verify_icon"):
+                if "not modified" in str(e).lower() or not g.get("verify_icon"):
                     raise
-                await q.edit_message_reply_markup(reply_markup=join_markup(target, missing, use_icon=False))
+                await q.edit_message_reply_markup(reply_markup=join_markup(g, target, missing, use_icon=False))
         except BadRequest as e:
             if "not modified" not in str(e).lower():
                 log.warning("Verify refresh failed: %s", e)
         await q.answer("❌ You have not joined all required channels yet.", show_alert=True)
         return
-    joined_cache[target] = time.time()
-    prompts.pop((q.message.chat.id, target), None)
+    joined_cache[(chat_id, target)] = time.time()
+    prompts.pop((chat_id, target), None)
     await q.answer("✅ Verified successfully")
     try:
         await q.edit_message_text(
@@ -485,43 +492,67 @@ async def on_verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ----------------------------------------------------------------- group list helpers
 def save_group(chat):
     gid = str(chat.id)
-    old = db.groups.get(gid, {})
     new = gid not in db.groups
-    db.groups[gid] = {"title": chat.title or gid, "type": chat.type,
-                      "added": old.get("added", int(time.time())), "gate": old.get("gate", True)}
+    if new:
+        db.groups[gid] = {"title": chat.title or gid, "type": chat.type, "added": int(time.time()),
+                          **group_defaults()}
+    else:
+        db.groups[gid]["title"] = chat.title or gid
+        db.groups[gid]["type"] = chat.type
     db.save()
     return new
 
 
 def replace_group(old_gid, chat):
-    """Swap one group for another, keeping its position and gate setting."""
-    keep_gate = db.groups.get(old_gid, {}).get("gate", True)
+    """Swap one group for another, keeping its position AND all its settings."""
     new_gid = str(chat.id)
     items = list(db.groups.items())
     db.groups.clear()
     for k, v in items:
         if k == old_gid:
-            db.groups[new_gid] = {"title": chat.title or new_gid, "type": chat.type,
-                                  "added": v.get("added", int(time.time())), "gate": keep_gate}
+            v["title"], v["type"] = chat.title or new_gid, chat.type
+            db.groups[new_gid] = v
         elif k != new_gid:
             db.groups[k] = v
     db.save()
 
 
-def new_channel(link, chat):
+def new_channel(gid, link, chat):
     ch = {"id": uuid.uuid4().hex[:8], "link": link, "chat": chat}
-    db.settings["channels"].append(ch)
+    db.groups[gid]["channels"].append(ch)
     db.save()
-    joined_cache.clear()
+    for k in [k for k in joined_cache if k[0] == int(gid)]:
+        joined_cache.pop(k, None)
     return ch
 
 
-def find_channel(cid):
-    return next((c for c in db.settings["channels"] if c["id"] == cid), None)
+def find_channel(gid, cid):
+    return next((c for c in db.groups.get(gid, {}).get("channels", []) if c["id"] == cid), None)
 
 
-def channel_number(cid):
-    return next((i for i, c in enumerate(db.settings["channels"], 1) if c["id"] == cid), 0)
+def channel_number(gid, cid):
+    return next((i for i, c in enumerate(db.groups.get(gid, {}).get("channels", []), 1) if c["id"] == cid), 0)
+
+
+async def add_required_channel(bot, owner_chat_id, gid, chan):
+    """Add channel `chan` (Chat) as a required channel of group `gid` (from the 'bot added' button)."""
+    ok, err = await check_bot_access(bot, str(chan.id))
+    if not ok:
+        await bot.send_message(owner_chat_id, "❌ " + err)
+        return
+    link = f"https://t.me/{chan.username}" if chan.username else ""
+    if not link:
+        try:
+            link = await bot.export_chat_invite_link(chan.id)
+        except Exception:
+            link = ""
+    if link:
+        ch = new_channel(gid, link, str(chan.id))
+        await send_panel(bot, owner_chat_id, channel_panel(gid, ch["id"]), "✅ Channel Added\n\n")
+    else:
+        sessions[OWNER_ID] = {"action": "add", "gid": gid, "step": "link", "data": {"chat": str(chan.id)}}
+        await bot.send_message(owner_chat_id, "This channel is private. Send its invite link (https://t.me/+...).",
+                               reply_markup=cancel_markup(f"gc:{gid}"))
 
 
 # ----------------------------------------------------------------- panels (owner, buttons only)
@@ -530,19 +561,11 @@ def onoff(v):
 
 
 def main_panel():
-    s = db.settings
-    text = (
-        "⚙️ <b>Control Panel</b>\n\n"
-        f"📋 <b>Groups:</b> {len(db.groups)}\n"
-        f"📢 <b>Required Channels:</b> {len(s['channels'])}\n"
-        f"✅ <b>Verify Button</b> ({COLOR_LABELS[s['verify_color']]}): <code>{escape(s['verify_text'])}</code>\n"
-        f"🗑 <b>Delete Unjoined User's Message:</b> {onoff(s['delete_msg'])}\n\n"
-        "Choose what you want to do:")
+    text = ("⚙️ <b>Control Panel</b>\n\n"
+            f"📋 <b>Groups:</b> {len(db.groups)}\n\n"
+            "Open <b>My Groups</b>, pick a group and control its join requirement.")
     m = InlineKeyboardMarkup([
         [btn("📋 My Groups", data="m:groups", style="primary"), btn("➕ Add Group", data="m:addg", style="success")],
-        [btn("📢 Required Channels", data="a:chs", style="primary")],
-        [btn("✅ Verify Button Settings", data="a:v", style="success")],
-        [btn(f"🗑 Delete Unjoined Msg: {onoff(s['delete_msg'])}", data="a:delmsg")],
         [btn("❌ Close", data="m:close", style="danger")],
     ])
     return text, m
@@ -553,7 +576,7 @@ async def groups_panel(bot):
         lines = []
         for i, (gid, g) in enumerate(db.groups.items(), 1):
             st = await bot_status(bot, int(gid))
-            lines.append(f"<b>{i}.</b> {escape(g['title'])}\n    {st} · Gate {onoff(g.get('gate', True))}")
+            lines.append(f"<b>{i}.</b> {escape(g['title'])}\n    {st} · Gate {onoff(g['gate'])} · 📢 {len(g['channels'])}")
         body = "\n".join(lines)
     else:
         body = "No groups added yet."
@@ -570,78 +593,89 @@ async def group_panel(bot, gid):
     if not g:
         return await groups_panel(bot)
     st = await bot_status(bot, int(gid))
-    n = len(db.settings["channels"])
+    n = len(g["channels"])
     warn = "" if n else "\n⚠️ No required channels yet, so the gate does nothing. Add them in 📢 Required Channels."
-    text = (f"📋 <b>{escape(g['title'])}</b>\n\n<code>{gid}</code>\n"
-            f"Bot: {st}\n🔒 <b>Join Gate:</b> {onoff(g.get('gate', True))}\n"
-            f"📢 <b>Required Channels:</b> {n}{warn}")
+    text = (f"📋 <b>{escape(g['title'])}</b>\n<code>{gid}</code>\n\n"
+            f"Bot: {st}\n"
+            f"🔒 <b>Join Gate:</b> {onoff(g['gate'])}\n"
+            f"📢 <b>Required Channels:</b> {n}\n"
+            f"✅ <b>Verify Button:</b> <code>{escape(g['verify_text'])}</code>\n"
+            f"🗑 <b>Delete Unjoined User's Msg:</b> {onoff(g['delete_msg'])}{warn}")
     m = InlineKeyboardMarkup([
-        [btn(f"🔒 Join Gate: {onoff(g.get('gate', True))}", data=f"gt:{gid}", style="success" if g.get("gate", True) else "danger")],
-        [btn("✏️ Change Group", data=f"ge:{gid}", style="primary"), btn("🗑 Delete", data=f"gd:{gid}", style="danger")],
+        [btn(f"🔒 Join Gate: {onoff(g['gate'])}", data=f"gt:{gid}", style="success" if g["gate"] else "danger")],
+        [btn("📢 Required Channels", data=f"gc:{gid}", style="primary")],
+        [btn("✅ Verify Button", data=f"gv:{gid}", style="success")],
+        [btn(f"🗑 Delete Unjoined Msg: {onoff(g['delete_msg'])}", data=f"gm:{gid}")],
+        [btn("✏️ Change Group", data=f"ge:{gid}", style="primary"), btn("🗑 Delete Group", data=f"gd:{gid}", style="danger")],
         [btn("⬅️ Back", data="m:groups")],
     ])
     return text, m
 
 
-def channels_panel():
-    chans = db.settings["channels"]
+def channels_panel(gid):
+    g = db.groups.get(gid)
+    if not g:
+        return main_panel()
+    chans = g["channels"]
     if chans:
         lines = "\n".join(f"{i}. {channel_button_name(i)} — <code>{escape(c['chat'] or '-')}</code>"
                           for i, c in enumerate(chans, 1))
     else:
         lines = "No channels added yet."
-    text = ("📢 <b>Required Channels</b>\n"
-            "Users must join all of these to use your groups.\n"
+    text = (f"📢 <b>Required Channels</b>\n{escape(g['title'])}\n"
+            "Users must join all of these before they can message in this group.\n"
             "⚠️ The bot must be admin in every channel.\n"
             "🔒 Button name / colour are fixed. You can only add or delete.\n\n" + lines)
-    rows = [[btn("📢 " + channel_button_name(i), data=f"c:{c['id']}", style=CHANNEL_BUTTON_STYLE)]
+    rows = [[btn("📢 " + channel_button_name(i), data=f"c:{gid}:{c['id']}", style=CHANNEL_BUTTON_STYLE)]
             for i, c in enumerate(chans, 1)]
     if len(chans) < MAX_CHANNELS:
-        rows.append([btn("➕ Add Channel", data="a:chadd", style="success")])
-    rows.append([btn("⬅️ Back", data="m:main")])
+        rows.append([btn("➕ Add Channel", data=f"gca:{gid}", style="success")])
+    rows.append([btn("⬅️ Back", data=f"g:{gid}")])
     return text, InlineKeyboardMarkup(rows)
 
 
-def channel_panel(cid):
-    ch = find_channel(cid)
+def channel_panel(gid, cid):
+    ch = find_channel(gid, cid)
     if not ch:
-        return channels_panel()
+        return channels_panel(gid)
     text = ("📢 <b>Channel Button</b>\n\n"
-            f"Name: {channel_button_name(channel_number(cid))}\n"
+            f"Name: {channel_button_name(channel_number(gid, cid))}\n"
             f"Link: <code>{escape(ch['link'])}</code>\n"
             f"Channel ID/Username: <code>{escape(ch['chat'] or 'Not Set')}</code>\n"
             f"Colour: {COLOR_LABELS[CHANNEL_BUTTON_STYLE]} (Fixed)")
-    m = InlineKeyboardMarkup([[btn("🗑 Delete Channel", data=f"cd:{cid}", style="danger")],
-                              [btn("⬅️ Back", data="a:chs")]])
+    m = InlineKeyboardMarkup([[btn("🗑 Delete Channel", data=f"cd:{gid}:{cid}", style="danger")],
+                              [btn("⬅️ Back", data=f"gc:{gid}")]])
     return text, m
 
 
-def verify_panel():
-    s = db.settings
-    icon = s.get("verify_icon") or ""
-    text = ("✅ <b>Verify Button</b>\n"
+def verify_panel(gid):
+    g = db.groups.get(gid)
+    if not g:
+        return main_panel()
+    icon = g.get("verify_icon") or ""
+    text = (f"✅ <b>Verify Button</b>\n{escape(g['title'])}\n"
             "Shown under the channel buttons when a user has not joined.\n\n"
-            f"Text: <code>{escape(s['verify_text'])}</code>\n"
-            f"Colour: {COLOR_LABELS[s['verify_color']]}\n"
+            f"Text: <code>{escape(g['verify_text'])}</code>\n"
+            f"Colour: {COLOR_LABELS[g['verify_color']]}\n"
             f"💎 Premium Emoji: {'✅ Set' if icon else 'Not Set'}\n\n"
             "💡 To set a premium emoji: Edit Text, then send a message that has that emoji.")
-    rows = [[btn("✏️ Edit Text", data="a:vtxt", style="success"), btn("🎨 Edit Colour", data="a:vcol", style="success")]]
+    rows = [[btn("✏️ Edit Text", data=f"gvt:{gid}", style="success"), btn("🎨 Edit Colour", data=f"gvc:{gid}", style="success")]]
     if icon:
-        rows.append([btn("🗑 Remove Premium Emoji", data="a:vico", style="danger")])
-    rows.append([btn("⬅️ Back", data="m:main")])
+        rows.append([btn("🗑 Remove Premium Emoji", data=f"gvi:{gid}", style="danger")])
+    rows.append([btn("⬅️ Back", data=f"g:{gid}")])
     return text, InlineKeyboardMarkup(rows)
 
 
-def color_panel():
+def color_panel(gid):
     m = InlineKeyboardMarkup([
-        [btn("🟢 Green", data="col:verify:g", style="success"), btn("🔵 Blue", data="col:verify:b", style="primary"),
-         btn("🔴 Red", data="col:verify:r", style="danger")],
-        [btn("⬅️ Back", data="a:v")]])
+        [btn("🟢 Green", data=f"col:{gid}:g", style="success"), btn("🔵 Blue", data=f"col:{gid}:b", style="primary"),
+         btn("🔴 Red", data=f"col:{gid}:r", style="danger")],
+        [btn("⬅️ Back", data=f"gv:{gid}")]])
     return "🎨 <b>Choose Button Colour:</b>", m
 
 
-def cancel_markup():
-    return InlineKeyboardMarkup([[btn("⬅️ Cancel", data="m:main")]])
+def cancel_markup(back="m:main"):
+    return InlineKeyboardMarkup([[btn("⬅️ Cancel", data=back)]])
 
 
 async def show(q, panel, prefix=""):
@@ -673,7 +707,7 @@ async def on_owner_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     arg2 = parts[2] if len(parts) > 2 else ""
     sessions.pop(uid, None)
 
-    if kind == "add":        # from "bot was added" notification (group)
+    if kind == "add":        # "bot was added" notification (group)
         try:
             chat = await bot.get_chat(int(arg))
             new = save_group(chat)
@@ -682,30 +716,35 @@ async def on_owner_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             await q.answer(f"Failed: {e}", show_alert=True)
         return
-    if kind == "rch":        # from notification (channel) -> required channel
+
+    if kind == "rch":        # "bot was added" notification (channel) -> pick the group it is required for
+        if not db.groups:
+            await q.answer("Add a group first (Add Group), then add this channel to it.", show_alert=True)
+            return
         await q.answer()
         try:
-            chat = await bot.get_chat(int(arg))
+            chan = await bot.get_chat(int(arg))
         except Exception as e:
             await bot.send_message(chat_id, f"❌ {escape(str(e))}", parse_mode="HTML")
             return
-        ok, err = await check_bot_access(bot, str(chat.id))
-        if not ok:
-            await bot.send_message(chat_id, "❌ " + err)
+        if len(db.groups) == 1:
+            await add_required_channel(bot, chat_id, next(iter(db.groups)), chan)
             return
-        link = f"https://t.me/{chat.username}" if chat.username else ""
-        if not link:
-            try:
-                link = await bot.export_chat_invite_link(chat.id)
-            except Exception:
-                link = ""
-        if link:
-            ch = new_channel(link, str(chat.id))
-            await send_panel(bot, chat_id, channel_panel(ch["id"]), "✅ Channel Added\n\n")
-        else:
-            sessions[uid] = {"action": "add", "step": "link", "data": {"chat": str(chat.id)}}
-            await bot.send_message(chat_id, "This channel is private. Send its invite link (https://t.me/+...).",
-                                   reply_markup=cancel_markup())
+        rows = [[btn(f"{i}. {g['title'][:30]}", data=f"rchg:{chan.id}:{gid}", style="primary")]
+                for i, (gid, g) in enumerate(db.groups.items(), 1)]
+        rows.append([btn("⬅️ Cancel", data="m:main")])
+        await bot.send_message(chat_id, f"📢 Required for which group?\n<b>{escape(chan.title)}</b>",
+                               parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+        return
+    if kind == "rchg":
+        await q.answer()
+        try:
+            chan = await bot.get_chat(int(arg))
+        except Exception as e:
+            await bot.send_message(chat_id, f"❌ {escape(str(e))}", parse_mode="HTML")
+            return
+        if arg2 in db.groups:
+            await add_required_channel(bot, chat_id, arg2, chan)
         return
 
     await q.answer()
@@ -729,88 +768,84 @@ async def on_owner_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="HTML", reply_markup=cancel_markup())
         return
 
+    # ---- everything below belongs to one group: arg = group id ----
+    gid = arg
+    g = db.groups.get(gid)
+    if kind in ("g", "gt", "gm", "ge", "gd", "gdy", "gc", "gca", "gv", "gvt", "gvc", "gvi", "c", "cd", "cdy", "col") and not g:
+        await show(q, await groups_panel(bot))
+        return
+
     if kind == "g":
-        await show(q, await group_panel(bot, arg))
-        return
-    if kind == "gt":
-        if arg in db.groups:
-            db.groups[arg]["gate"] = not db.groups[arg].get("gate", True)
-            db.save()
-        await show(q, await group_panel(bot, arg))
-        return
-    if kind == "ge":
-        if arg in db.groups:
-            sessions[uid] = {"action": "editg", "gid": arg}
-            await bot.send_message(chat_id, "✏️ Send the NEW group ID (-100...), @username or t.me link.",
-                                   reply_markup=cancel_markup())
-        return
-    if kind == "gd":
-        g = db.groups.get(arg)
-        if g:
-            m = InlineKeyboardMarkup([[btn("✅ Yes, Delete", data=f"gdy:{arg}", style="danger"),
-                                       btn("⬅️ Cancel", data=f"g:{arg}")]])
-            await show(q, (f"🗑 <b>Remove {escape(g['title'])} from your list?</b>", m))
-        return
-    if kind == "gdy":
-        db.groups.pop(arg, None)
+        await show(q, await group_panel(bot, gid))
+    elif kind == "gt":
+        g["gate"] = not g["gate"]
+        db.save()
+        await show(q, await group_panel(bot, gid))
+    elif kind == "gm":
+        g["delete_msg"] = not g["delete_msg"]
+        db.save()
+        await show(q, await group_panel(bot, gid))
+    elif kind == "ge":
+        sessions[uid] = {"action": "editg", "gid": gid}
+        await bot.send_message(chat_id, "✏️ Send the NEW group ID (-100...), @username or t.me link.\n"
+                                        "All settings of this group are kept.", reply_markup=cancel_markup(f"g:{gid}"))
+    elif kind == "gd":
+        m = InlineKeyboardMarkup([[btn("✅ Yes, Delete", data=f"gdy:{gid}", style="danger"),
+                                   btn("⬅️ Cancel", data=f"g:{gid}")]])
+        await show(q, (f"🗑 <b>Remove {escape(g['title'])} and all its settings?</b>", m))
+    elif kind == "gdy":
+        db.groups.pop(gid, None)
         db.save()
         await show(q, await groups_panel(bot), "🗑 Removed\n\n")
-        return
 
-    if kind == "a":
-        if arg == "chs":
-            await show(q, channels_panel())
-        elif arg == "v":
-            await show(q, verify_panel())
-        elif arg == "vcol":
-            await show(q, color_panel())
-        elif arg == "vico":
-            db.settings["verify_icon"] = ""
-            db.save()
-            await show(q, verify_panel(), "✅ Updated\n\n")
-        elif arg == "delmsg":
-            db.settings["delete_msg"] = not db.settings["delete_msg"]
-            db.save()
-            await show(q, main_panel())
-        elif arg == "vtxt":
-            sessions[uid] = {"action": "vtxt"}
-            await bot.send_message(
-                chat_id,
-                "✏️ Send the new VERIFY button text.\n💎 You can also send a message with a premium emoji. "
-                "It will be used on the button.", reply_markup=cancel_markup())
-        elif arg == "chadd":
-            if len(db.settings["channels"]) >= MAX_CHANNELS:
-                await bot.send_message(chat_id, f"❌ Maximum {MAX_CHANNELS} channels allowed.")
-                return
-            sessions[uid] = {"action": "add", "step": "link", "data": {}}
-            await bot.send_message(
-                chat_id,
-                "➕ <b>Add Channel</b>\n\nStep 1/2: send the channel join link (https://t.me/...).\n"
-                "Button name and colour are automatic.\n"
-                "💡 Or just add the bot to the channel as admin and tap the button I send you.",
-                parse_mode="HTML", reply_markup=cancel_markup())
-        return
-
-    if kind == "c":
-        await show(q, channel_panel(arg))
-        return
-    if kind == "cd":
-        m = InlineKeyboardMarkup([[btn("✅ Yes, Delete", data=f"cdy:{arg}", style="danger"),
-                                   btn("⬅️ Cancel", data=f"c:{arg}")]])
+    # ---- required channels of this group ----
+    elif kind == "gc":
+        await show(q, channels_panel(gid))
+    elif kind == "gca":
+        if len(g["channels"]) >= MAX_CHANNELS:
+            await bot.send_message(chat_id, f"❌ Maximum {MAX_CHANNELS} channels allowed.")
+            return
+        sessions[uid] = {"action": "add", "gid": gid, "step": "link", "data": {}}
+        await bot.send_message(
+            chat_id,
+            f"➕ <b>Add Channel</b> for {escape(g['title'])}\n\nStep 1/2: send the channel join link (https://t.me/...).\n"
+            "Button name and colour are automatic.\n"
+            "💡 Or just add the bot to the channel as admin and tap the button I send you.",
+            parse_mode="HTML", reply_markup=cancel_markup(f"gc:{gid}"))
+    elif kind == "c":
+        await show(q, channel_panel(gid, arg2))
+    elif kind == "cd":
+        m = InlineKeyboardMarkup([[btn("✅ Yes, Delete", data=f"cdy:{gid}:{arg2}", style="danger"),
+                                   btn("⬅️ Cancel", data=f"c:{gid}:{arg2}")]])
         await show(q, ("🗑 <b>Delete this channel button?</b>", m))
-        return
-    if kind == "cdy":
-        db.settings["channels"] = [c for c in db.settings["channels"] if c["id"] != arg]
+    elif kind == "cdy":
+        g["channels"] = [c for c in g["channels"] if c["id"] != arg2]
         db.save()
-        joined_cache.clear()
-        await show(q, channels_panel(), "🗑 Deleted\n\n")
-        return
-    if kind == "col" and arg == "verify":
+        for k in [k for k in joined_cache if k[0] == int(gid)]:
+            joined_cache.pop(k, None)
+        await show(q, channels_panel(gid), "🗑 Deleted\n\n")
+
+    # ---- verify button of this group ----
+    elif kind == "gv":
+        await show(q, verify_panel(gid))
+    elif kind == "gvc":
+        await show(q, color_panel(gid))
+    elif kind == "gvi":
+        g["verify_icon"] = ""
+        db.save()
+        await show(q, verify_panel(gid), "✅ Updated\n\n")
+    elif kind == "gvt":
+        sessions[uid] = {"action": "vtxt", "gid": gid}
+        await bot.send_message(
+            chat_id,
+            "✏️ Send the new VERIFY button text.\n💎 You can also send a message with a premium emoji. "
+            "It will be used on the button.", reply_markup=cancel_markup(f"gv:{gid}"))
+    elif kind == "col":
         style = COLOR_CODES.get(arg2)
         if style:
-            db.settings["verify_color"] = style
+            g["verify_color"] = style
             db.save()
-            await show(q, verify_panel(), "✅ Colour Updated\n\n")
+            await show(q, verify_panel(gid), "✅ Colour Updated\n\n")
 
 
 # ----------------------------------------------------------------- owner: typed values (wizards)
@@ -865,14 +900,22 @@ async def handle_session(update: Update, context: ContextTypes.DEFAULT_TYPE, ses
         if not value or len(value) > 64:
             await m.reply_text("❌ Button text must be between 1 and 64 characters.")
             return
-        db.settings["verify_text"] = value
-        db.settings["verify_icon"] = icon
+        g = db.groups.get(sess["gid"])
+        if not g:
+            done()
+            return
+        g["verify_text"] = value
+        g["verify_icon"] = icon
         db.save()
         done()
-        await send_panel(bot, chat_id, verify_panel(), "✅ Updated\n\n")
+        await send_panel(bot, chat_id, verify_panel(sess["gid"]), "✅ Updated\n\n")
         return
 
     if action == "add":
+        gid = sess["gid"]
+        if gid not in db.groups:
+            done()
+            return
         d = sess["data"]
         step = sess["step"]
         if step == "link":
@@ -885,27 +928,27 @@ async def handle_session(update: Update, context: ContextTypes.DEFAULT_TYPE, ses
                 return
             d["link"] = value
             if d.get("chat"):                      # id already known (from notification)
-                ch = new_channel(value, d["chat"])
+                ch = new_channel(gid, value, d["chat"])
                 done()
-                await send_panel(bot, chat_id, channel_panel(ch["id"]), "✅ Channel Added\n\n")
+                await send_panel(bot, chat_id, channel_panel(gid, ch["id"]), "✅ Channel Added\n\n")
                 return
             derived = derive_chat_from_link(value)
             if derived:
                 ok, err = await check_bot_access(bot, derived)
                 if ok:
-                    ch = new_channel(value, derived)
+                    ch = new_channel(gid, value, derived)
                     done()
-                    await send_panel(bot, chat_id, channel_panel(ch["id"]), "✅ Channel Added\n\n")
+                    await send_panel(bot, chat_id, channel_panel(gid, ch["id"]), "✅ Channel Added\n\n")
                     return
                 sess["step"] = "chat"
-                await bot.send_message(chat_id, "❌ " + err, reply_markup=cancel_markup())
+                await bot.send_message(chat_id, "❌ " + err, reply_markup=cancel_markup(f"gc:{gid}"))
                 return
             sess["step"] = "chat"
             await bot.send_message(
                 chat_id,
                 "Step 2/2: this is a private/invite link, so send the channel numeric ID (-100...) "
                 "or @username.\n💡 You can also forward any post from that channel.\n"
-                "Bot must be admin in the channel.", reply_markup=cancel_markup())
+                "Bot must be admin in the channel.", reply_markup=cancel_markup(f"gc:{gid}"))
         elif step == "chat":
             fo = getattr(m, "forward_origin", None)
             fch = (getattr(fo, "chat", None) or getattr(fo, "sender_chat", None)) if fo else None
@@ -917,9 +960,9 @@ async def handle_session(update: Update, context: ContextTypes.DEFAULT_TYPE, ses
             if not ok:
                 await m.reply_text("❌ " + err)
                 return
-            ch = new_channel(d["link"], chat)
+            ch = new_channel(gid, d["link"], chat)
             done()
-            await send_panel(bot, chat_id, channel_panel(ch["id"]), "✅ Channel Added\n\n")
+            await send_panel(bot, chat_id, channel_panel(gid, ch["id"]), "✅ Channel Added\n\n")
 
 
 async def on_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1009,12 +1052,12 @@ def main():
     asyncio.set_event_loop(asyncio.new_event_loop())   # Python 3.14 fix
     app = Application.builder().bot(StyledBot(token)).build()
     app.add_handler(CallbackQueryHandler(on_verify, pattern=r"^v:"))
-    app.add_handler(CallbackQueryHandler(on_owner_button, pattern=r"^(m|g|gt|ge|gd|gdy|a|c|cd|cdy|col|add|rch)(:|$)"))
+    app.add_handler(CallbackQueryHandler(on_owner_button, pattern=r"^(m|g|gt|gm|ge|gd|gdy|gc|gca|gv|gvt|gvc|gvi|c|cd|cdy|col|add|rch|rchg):"))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE, on_private_message))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.StatusUpdate.ALL, gate_watch), group=1)
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_error_handler(on_error)
-    log.info("Bot starting... groups: %d, required channels: %d", len(db.groups), len(db.settings["channels"]))
+    log.info("Bot starting... groups: %d", len(db.groups))
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
