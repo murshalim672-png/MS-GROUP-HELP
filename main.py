@@ -429,7 +429,7 @@ async def send_join_prompt(bot, chat_id, g, user, missing, missing_groups=None):
         requirement_text = "You must join all the required groups to continue messaging"
     text = (f"<blockquote>👋 Hello {name_text(user)}\n\n"
             f"⚠️ {requirement_text}\n\n"
-            "👇 Join the buttons below then tap Verify</blockquote>")
+            "👇 Join the buttons below then tap on Verify join button</blockquote>")
     try:
         return await bot.send_message(chat_id, text, parse_mode="HTML",
                                       reply_markup=join_markup(g, user.id, missing, missing_groups))
@@ -527,9 +527,9 @@ async def on_verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await q.edit_message_text(
             f"<blockquote>👋 Hello {name_text(q.from_user)}\n\n"
-            f"🎉 Welcome to {escape(q.message.chat.title or 'the group')}\n\n"
+            f"🎉 Welcome to \n{escape(q.message.chat.title or 'the group')}\n\n"
             f"❤️ {thank_you_text}\n\n"
-            "✅ You are verified. You can now continue messaging</blockquote>",
+            "✅ You are verified You can now continue messaging</blockquote>",
             parse_mode="HTML")
         later(_del_after(q.message, 10))
     except Exception:
