@@ -173,7 +173,6 @@ db = Store()
 sessions = {}          # owner's active "send me a value" wizard
 joined_cache = {}      # user_id -> time of last successful full check (60 s)
 prompts = {}           # (chat_id, user_id) -> (message_id, time) join prompt already shown
-JOINED_CACHE_SECONDS = 60
 PROMPT_SECONDS = 600
 _tasks = set()
 
@@ -423,13 +422,13 @@ async def send_join_prompt(bot, chat_id, g, user, missing, missing_groups=None):
     has_channels = bool(g.get("channels"))
     has_groups = bool(g.get("required_groups"))
     if has_channels and has_groups:
-        requirement_text = "⚠️ You must join all the required channels or groups to start messaging"
+        requirement_text = "You must join all the required channels or groups to continue messaging"
     elif has_channels:
-        requirement_text = "⚠️ You must join all the required channels to start messaging"
+        requirement_text = "You must join all the required channels to continue messaging"
     else:
-        requirement_text = "⚠️ You must join all the required groups to start messaging"
+        requirement_text = "You must join all the required groups to continue messaging"
     text = (f"👋 Hello {name_text(user)}\n\n"
-            f"{requirement_text}\n\n"
+            f"<blockquote>⚠️ {requirement_text}</blockquote>\n\n"
             "👇 Join the buttons below then tap Verify")
     try:
         return await bot.send_message(chat_id, text, parse_mode="HTML",
@@ -448,22 +447,16 @@ async def gate_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not m or not user or user.is_bot or m.sender_chat or getattr(m, "is_automatic_forward", False):
         return
     g = db.groups.get(str(chat.id))
-    if not g or not g["gate"] or not (g["channels"] or g.get("required_groups")) or user.id == OWNER_ID:
+    if not g or not g["gate"] or not (g["channels"] or g.get("required_groups")):
         return
-    if time.time() - joined_cache.get((chat.id, user.id), 0) < JOINED_CACHE_SECONDS:
-        return
+    # Always check current membership for every incoming message. Do not trust a
+    # previous verification cache because a user may leave a required chat later.
+    joined_cache.pop((chat.id, user.id), None)
     if not await bot_is_admin(context.bot, chat.id):
         return
     missing, missing_groups = await all_missing_requirements(context.bot, g, user.id)
     if not missing and not missing_groups:
-        joined_cache[(chat.id, user.id)] = time.time()
         return
-    try:     # group admins are never blocked
-        cm = await context.bot.get_chat_member(chat.id, user.id)
-        if cm.status in ("administrator", "creator"):
-            return
-    except Exception:
-        pass
     # Keep one visible join prompt per user. Replace the previous prompt so a fresh
     # prompt is shown after every blocked message instead of silently throttling it.
     key = (chat.id, user.id)
@@ -520,14 +513,22 @@ async def on_verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 log.warning("Verify refresh failed: %s", e)
         await q.answer("❌ You have not joined all required channels yet.", show_alert=True)
         return
-    joined_cache[(chat_id, target)] = time.time()
+    joined_cache.pop((chat_id, target), None)
     prompts.pop((chat_id, target), None)
     await q.answer("✅ Verified successfully")
+    has_channels = bool(g.get("channels"))
+    has_groups = bool(g.get("required_groups"))
+    if has_channels and has_groups:
+        thank_you_text = "Thank you for joining all the required channels or groups"
+    elif has_channels:
+        thank_you_text = "Thank you for joining all the required channels"
+    else:
+        thank_you_text = "Thank you for joining all the required groups"
     try:
         await q.edit_message_text(
             f"👋 Hello {name_text(q.from_user)}\n\n🎉 Welcome to {escape(q.message.chat.title or 'the group')}\n\n"
-            "❤️ Thank you for joining all the required channels\n\n"
-            "✅ You are verified. Now you can use this group",
+            f"<blockquote>❤️ {thank_you_text}</blockquote>\n\n"
+            "✅ You are verified. You can now continue messaging",
             parse_mode="HTML")
         later(_del_after(q.message, 10))
     except Exception:
