@@ -420,9 +420,17 @@ def join_markup(g, user_id, missing, missing_groups=None, use_icon=True):
 
 async def send_join_prompt(bot, chat_id, g, user, missing, missing_groups=None):
     missing_groups = missing_groups or []
-    text = (f"👋 Hello {name_text(user)}\\n\\n"
-            "⚠️ You must join all required channels/groups to use this group\\n\\n"
-            "👇 Join the buttons below, then tap Verify")
+    has_channels = bool(g.get("channels"))
+    has_groups = bool(g.get("required_groups"))
+    if has_channels and has_groups:
+        requirement_text = "⚠️ You must join all the required channels or groups to start messaging"
+    elif has_channels:
+        requirement_text = "⚠️ You must join all the required channels to start messaging"
+    else:
+        requirement_text = "⚠️ You must join all the required groups to start messaging"
+    text = (f"👋 Hello {name_text(user)}\n\n"
+            f"{requirement_text}\n\n"
+            "👇 Join the buttons below then tap Verify")
     try:
         return await bot.send_message(chat_id, text, parse_mode="HTML",
                                       reply_markup=join_markup(g, user.id, missing, missing_groups))
