@@ -1,114 +1,205 @@
 # -*- coding: utf-8 -*-
-"""GroupHelp Bot - Telegram group management bot (Rose-style) with a
-configurable "Wrong Format" numeric guard."""
-import asyncio, copy, functools, html, json, logging, os, re, sys, threading, time
-from collections import defaultdict, deque
-from datetime import datetime, timedelta, timezone
+"""Private group-help bot (owner only, button controlled).
+ - Owner manages groups (add / change / delete) with buttons in the bot DM.
+ - REQUIRED CHANNELS join gate (ported from the like-bot): JOIN CHANNEL 1, 2... + VERIFY.
+ - Bot text style: first letter bold, rest small-caps (ported from the like-bot)."""
+import asyncio, html, json, logging, os, re, sys, threading, time, uuid
+from html import escape
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from telegram import ChatPermissions, Update
-from telegram.constants import ChatType, ParseMode
-from telegram.ext import (Application, CommandHandler, ContextTypes,
-                          MessageHandler, filters)
+from telegram import InlineKeyboardButton as IKB, InlineKeyboardMarkup, Update
+from telegram.constants import ChatType
+from telegram.error import BadRequest
+from telegram.ext import (Application, CallbackQueryHandler, ChatMemberHandler, ContextTypes,
+                          ExtBot, MessageHandler, filters)
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
-log = logging.getLogger("grouphelp")
+log = logging.getLogger("bot")
 
 OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)
-GROUPS = (ChatType.GROUP, ChatType.SUPERGROUP)
-ANON_ADMIN_BOT = 1087968824
+DATA_FILE = "data.json"
+
+# ----- constants copied from the like-bot -----
+VALID_STYLES = {"success", "primary", "danger"}      # green / blue / red
+COLOR_LABELS = {"success": "🟢 GREEN", "primary": "🔵 BLUE", "danger": "🔴 RED"}
+COLOR_CODES = {"g": "success", "b": "primary", "r": "danger"}
+MAX_CHANNELS = 10
+
+# Channel buttons are FIXED: always BLUE (primary), name is automatic
+# "𝗝𝗢𝗜𝗡 𝗖𝗛𝗔𝗡𝗡𝗘𝗟 𝟭", "𝗝𝗢𝗜𝗡 𝗖𝗛𝗔𝗡𝗡𝗘𝗟 𝟮" ... and cannot be edited from /admin.
+CHANNEL_BUTTON_STYLE = "primary"
+DEFAULT_VERIFY_TEXT = "✅ 𝗩𝗘𝗥𝗜𝗙𝗬 𝗝𝗢𝗜𝗡"
+
+
+
+
+def _sans_bold(text):
+    """ASCII letters/digits -> mathematical sans-serif bold (𝗔𝗕𝗖 𝟭𝟮𝟯)."""
+    out = []
+    for ch in text:
+        if "A" <= ch <= "Z":
+            out.append(chr(0x1D5D4 + ord(ch) - 65))
+        elif "a" <= ch <= "z":
+            out.append(chr(0x1D5EE + ord(ch) - 97))
+        elif "0" <= ch <= "9":
+            out.append(chr(0x1D7EC + ord(ch) - 48))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def channel_button_name(number):
+    return _sans_bold(f"JOIN CHANNEL {number}")
+
+
+
+
+# ----- bot text style copied from the like-bot -----
+_BOLD_CAPS = {chr(65 + i): chr(0x1D400 + i) for i in range(26)}
+_SMALL_CAPS = dict(zip("abcdefghijklmnopqrstuvwxyz", "ᴀʙᴄᴅᴇғɢʜɪᴊᴋʟᴍɴᴏᴘǫʀsᴛᴜᴠᴡxʏᴢ"))
+_STYLE_TOKEN = re.compile(r"((?:https?|tg)://\S+|(?<![A-Za-z0-9_])[/@][A-Za-z0-9_]+|\\.)|([A-Za-z\U0001D400-\U0001D419ᴀʙᴄᴅᴇғɢʜɪᴊᴋʟᴍɴᴏᴘǫʀᴛᴜᴠᴡʏᴢ]+)", re.I)
+_HTML_SPLIT = re.compile(r"(<[^>]*>|&#?\w+;)")
+_SKIP_TAG = re.compile(r"<(/?)(code|a|pre)\b", re.I)
+
+
+def _style_word(w):
+    # Already styled word (has non-ASCII small-caps/bold letters)? Leave it. Keeps sc() idempotent,
+    # because plain "s" and "x" are also ASCII letters in this style.
+    if not w.isascii():
+        return w
+    return _BOLD_CAPS[w[0].upper()] + "".join(_SMALL_CAPS[c.lower()] for c in w[1:])
+
+
+# Invisible marker (WORD JOINER). Text between two markers is a user NAME and is never restyled,
+# so "Murshalim Sk" stays exactly "Murshalim Sk".
+NAME_MARK = "\u2060"
+
+
+def _style_plain_raw(text):
+    return _STYLE_TOKEN.sub(lambda m: m.group(1) if m.group(1) else _style_word(m.group(2)), text)
+
+
+def _style_plain(text, state=None):
+    if state is None:
+        state = {"in": False}
+    out = []
+    for i, part in enumerate(text.split(NAME_MARK)):
+        if i > 0:
+            state["in"] = not state["in"]
+            out.append(NAME_MARK)
+        out.append(part if state["in"] else _style_plain_raw(part))
+    return "".join(out)
+
+
+def sc(text, html=True):
+    """Convert normal text into the bot style. html=True keeps tags/entities and <code>/<a>/<pre> content untouched."""
+    if not isinstance(text, str):
+        return text
+    if not html:
+        return _style_plain(text)
+    out, depth = [], 0
+    state = {"in": False}
+    for tok in _HTML_SPLIT.split(text):
+        if not tok:
+            continue
+        if tok.startswith("<") and tok.endswith(">"):
+            m = _SKIP_TAG.match(tok)
+            if m:
+                depth = max(0, depth - 1) if m.group(1) else depth + 1
+            out.append(tok)
+        elif tok.startswith("&") and tok.endswith(";"):
+            out.append(tok)
+        else:
+            out.append(tok if depth else _style_plain(tok, state))
+    return "".join(out)
+
+
+
 
 # ----------------------------------------------------------------- storage
-DEFAULTS = {
-    "fmt": {
-        "on": False,                # feature OFF until you turn it on
-        "msg": "❌ Wrong Format",
-        "cmds": [],                 # command lines shown under the message
-        "min": 7, "max": 12,
-        "mode": "pure",             # pure = message is only a number, contains = number anywhere
-        "exempt_admins": True,
-        "delete_msg": True,
-        "autodel": 15,              # seconds, 0 = keep the warning
-    },
-    "welcome": {"on": True, "text": "Welcome {mention} to {chat}! 🎉"},
-    "goodbye": {"on": False, "text": "Goodbye {first}!"},
-    "rules": "",
-    "warn_limit": 3,
-    "warns": {},
-    "notes": {},
-    "filters": [],
-    "blacklist": [],
-    "locks": [],
-    "flood": 0,
+DEFAULT_SETTINGS = {
+    "verify_text": DEFAULT_VERIFY_TEXT,
+    "verify_color": "success",
+    "verify_icon": "",          # premium emoji id on the VERIFY button ("" = none)
+    "channels": [],             # required channels: [{"id","link","chat"}]
+    "delete_msg": True,         # delete the message of a user who has not joined
 }
 
 
-def merge(base, doc):
-    out = copy.deepcopy(base)
-    for k, v in doc.items():
-        if isinstance(v, dict) and isinstance(out.get(k), dict):
-            out[k] = merge(out[k], v)
-        else:
-            out[k] = v
-    return out
-
-
 class Store:
+    """JSON file: {"groups": {"<chat_id>": {title,type,added,gate}}, "settings": {...}}"""
+
     def __init__(self):
-        self.cache = {}
-        self.uri = os.getenv("MONGO_URI", "").strip()
-        self.col = None
-        self.path = "data.json"
-        self.file = {}
-        if not self.uri and os.path.exists(self.path):
+        self.data = {"groups": {}, "settings": json.loads(json.dumps(DEFAULT_SETTINGS))}
+        if os.path.exists(DATA_FILE):
             try:
-                with open(self.path, encoding="utf-8") as fh:
-                    self.file = json.load(fh)
+                with open(DATA_FILE, encoding="utf-8") as fh:
+                    raw = json.load(fh)
+                self.data["groups"] = raw.get("groups", {})
+                self.data["settings"].update(raw.get("settings", {}))
             except Exception:
-                log.exception("data.json read failed")
+                log.exception("could not read data.json")
+        s = self.data["settings"]
+        if s.get("verify_color") not in VALID_STYLES:
+            s["verify_color"] = "success"
 
-    def _col(self):
-        if self.col is None:
-            from motor.motor_asyncio import AsyncIOMotorClient
-            self.col = AsyncIOMotorClient(self.uri)[os.getenv("DB_NAME", "grouphelp")]["chats"]
-        return self.col
+    @property
+    def groups(self):
+        return self.data["groups"]
 
-    async def get(self, chat_id):
-        if chat_id in self.cache:
-            return self.cache[chat_id]
-        raw = {}
+    @property
+    def settings(self):
+        return self.data["settings"]
+
+    def save(self):
         try:
-            if self.uri:
-                raw = await self._col().find_one({"_id": chat_id}) or {}
-                raw.pop("_id", None)
-            else:
-                raw = self.file.get(str(chat_id), {})
+            tmp = DATA_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(self.data, fh, ensure_ascii=False, indent=1)
+            os.replace(tmp, DATA_FILE)
         except Exception:
-            log.exception("db read failed")
-        self.cache[chat_id] = merge(DEFAULTS, raw)
-        return self.cache[chat_id]
-
-    async def save(self, chat_id):
-        doc = self.cache.get(chat_id)
-        if doc is None:
-            return
-        try:
-            if self.uri:
-                await self._col().replace_one({"_id": chat_id}, {**doc, "_id": chat_id}, upsert=True)
-            else:
-                self.file[str(chat_id)] = doc
-                tmp = self.path + ".tmp"
-                with open(tmp, "w", encoding="utf-8") as fh:
-                    json.dump(self.file, fh, ensure_ascii=False)
-                os.replace(tmp, self.path)
-        except Exception:
-            log.exception("db write failed")
+            log.exception("could not write data.json")
 
 
-store = Store()
-
-# ----------------------------------------------------------------- helpers
+db = Store()
+sessions = {}          # owner's active "send me a value" wizard
+joined_cache = {}      # user_id -> time of last successful full check (60 s)
+prompts = {}           # (chat_id, user_id) -> (message_id, time) join prompt already shown
+JOINED_CACHE_SECONDS = 60
+PROMPT_SECONDS = 600
 _tasks = set()
+
+
+# ----------------------------------------------------------------- styled bot / buttons
+def _styled(text, kwargs):
+    if not isinstance(text, str):
+        return text
+    return sc(text, kwargs.get("parse_mode") == "HTML")
+
+
+class StyledBot(ExtBot):
+    """Every message / edit / popup goes through the bot text style sc()."""
+
+    async def send_message(self, chat_id, text, *args, **kwargs):
+        return await super().send_message(chat_id, _styled(text, kwargs), *args, **kwargs)
+
+    async def edit_message_text(self, text, *args, **kwargs):
+        return await super().edit_message_text(_styled(text, kwargs), *args, **kwargs)
+
+    async def answer_callback_query(self, callback_query_id, text=None, *args, **kwargs):
+        if isinstance(text, str):
+            text = sc(text, False)
+        return await super().answer_callback_query(callback_query_id, text, *args, **kwargs)
+
+
+def btn(text, url=None, data=None, style=None, icon=None):
+    """Inline button: styled text, optional colour (success/primary/danger) and premium icon."""
+    extra = {}
+    if style in VALID_STYLES:
+        extra["style"] = style
+    if icon:
+        extra["icon_custom_emoji_id"] = icon
+    return IKB(sc(text, False), url=url, callback_data=data, api_kwargs=extra or None)
 
 
 def later(coro):
@@ -125,100 +216,114 @@ async def _del_after(msg, sec):
         pass
 
 
-def esc(s):
-    return html.escape(str(s or ""))
+def full_name(user):
+    parts = [p for p in (user.first_name, getattr(user, "last_name", None)) if p]
+    return " ".join(parts).strip() or "USER"
 
 
-def mention(u):
-    name = esc(u.first_name or u.username or str(u.id))
-    return f'<a href="tg://user?id={u.id}">{name}</a>'
+def name_text(user):
+    """Plain (non-clickable) name that the text style never restyles."""
+    name = escape(full_name(user)).replace("@", "@\u2060")
+    return NAME_MARK + name + NAME_MARK
 
 
-def rest(m):
-    parts = (m.text or m.caption or "").split(None, 1)
-    return parts[1].strip() if len(parts) > 1 else ""
+def say(m, text, **kw):
+    return m.reply_text(text, parse_mode="HTML", disable_web_page_preview=True, **kw)
 
 
-def render(tpl, user, chat, **extra):
-    s = esc(tpl)
-    rep = {"{mention}": mention(user), "{first}": esc(user.first_name), "{id}": str(user.id),
-           "{username}": esc("@" + user.username) if user.username else esc(user.first_name),
-           "{chat}": esc(chat.title)}
-    rep.update(extra)
-    for k, v in rep.items():
-        s = s.replace(k, v)
-    return s
+# ----------------------------------------------------------------- chat helpers
+def parse_ref(ref):
+    """id / @username / t.me link -> value accepted by bot.get_chat()."""
+    ref = ref.strip()
+    if re.fullmatch(r"-?\d+", ref):
+        return int(ref)
+    mt = re.match(r"^(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/(.+)$", ref, re.I)
+    if mt:
+        part = mt.group(1).split("?")[0].strip("/")
+        if part.startswith("+") or part.lower().startswith("joinchat"):
+            raise ValueError("private_link")
+        bits = part.split("/")
+        if bits[0] == "c" and len(bits) > 1 and bits[1].isdigit():
+            return int("-100" + bits[1])
+        return "@" + bits[0]
+    if re.fullmatch(r"@?[A-Za-z][A-Za-z0-9_]{3,}", ref):
+        return ref if ref.startswith("@") else "@" + ref
+    raise ValueError("bad_ref")
 
 
-def parse_dur(s):
-    mt = re.fullmatch(r"(\d+)([smhd])", (s or "").lower())
-    if not mt:
-        return None
-    return int(mt[1]) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[mt[2]]
+def derive_chat_from_link(link):
+    m = re.match(r"^https?://t\.me/([A-Za-z][A-Za-z0-9_]{4,31})/?$", link.strip())
+    return ("@" + m.group(1)) if m else ""
 
 
-async def is_admin(context, chat_id, user_id, msg=None, owner_bypass=True):
-    if user_id == ANON_ADMIN_BOT or (owner_bypass and user_id == OWNER_ID):
-        return True
-    if msg is not None and msg.sender_chat and msg.sender_chat.id == chat_id:
-        return True
+def normalize_chat(value):
+    v = value.strip()
+    d = derive_chat_from_link(v)
+    if d:
+        return d
+    if v.lstrip("-").isdigit():
+        return v
+    if re.match(r"^@?[A-Za-z][A-Za-z0-9_]{4,31}$", v):
+        return "@" + v.lstrip("@")
+    return ""
+
+
+def valid_link(value):
+    return value.startswith(("https://", "http://", "tg://"))
+
+
+def err_text(e):
+    s = str(e)
+    if s == "private_link":
+        return ("❌ Private invite links (t.me/+...) cannot be converted to a chat ID by a bot. "
+                "Send the numeric ID (-100...) or forward a message from that chat.")
+    if s == "bad_ref":
+        return "❌ Send a chat ID (-100...), @username or a t.me link."
+    if s == "not_group":
+        return "❌ That is not a group or channel."
+    if s == "is_channel":
+        return "❌ That is a channel. Add channels under 📢 Required Channels."
+    if s == "not_channel":
+        return "❌ That is not a channel."
+    return f"❌ Could not find that chat. Make sure the bot is added there (or the chat is public).\n<i>{escape(s)}</i>"
+
+
+async def chat_from_message(bot, m):
+    """Chat from a forwarded post / anonymous-admin forward, or from the typed id/link."""
+    fo = getattr(m, "forward_origin", None)
+    if fo is not None:
+        ch = getattr(fo, "chat", None) or getattr(fo, "sender_chat", None)
+        if ch is not None:
+            return ch
+    chat = await bot.get_chat(parse_ref((m.text or "").strip()))
+    if chat.type == ChatType.PRIVATE:
+        raise ValueError("not_group")
+    return chat
+
+
+async def bot_status(bot, chat_id):
     try:
-        cm = await context.bot.get_chat_member(chat_id, user_id)
-        return cm.status in ("administrator", "creator")
+        cm = await bot.get_chat_member(chat_id, bot.id)
     except Exception:
-        return False
-
-
-def admin_cmd(func):
-    @functools.wraps(func)
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        chat, m, u = update.effective_chat, update.effective_message, update.effective_user
-        if not m or not u:
-            return
-        if chat.type not in GROUPS:
-            await m.reply_text("This command works only in groups.")
-            return
-        if not await is_admin(context, chat.id, u.id, m):
-            await m.reply_text("❌ This command is for admins only.")
-            return
-        return await func(update, context)
-    return wrapper
-
-
-GLOBAL = 0   # global settings doc (Wrong Format guard), set by owner in private chat
-
-
-def owner_dm(func):
-    """Owner-only, private-chat-only commands (all customisation happens here)."""
-    @functools.wraps(func)
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        chat, m, u = update.effective_chat, update.effective_message, update.effective_user
-        if not m or not u:
-            return
-        if u.id != OWNER_ID:
-            if chat.type == ChatType.PRIVATE:
-                await m.reply_text("🔒 This is a private bot.")
-            return
-        if chat.type != ChatType.PRIVATE:
-            try:
-                await m.delete()
-            except Exception:
-                pass
-            await context.bot.send_message(chat.id, "🔒 Send this command to me in private chat, not in the group.")
-            return
-        return await func(update, context)
-    return wrapper
+        return "❌ bot not in chat"
+    if cm.status == "creator":
+        return "✅ admin"
+    if cm.status == "administrator":
+        return "✅ admin" if getattr(cm, "can_delete_messages", True) is not False else "⚠️ admin (no delete right)"
+    if cm.status == "member":
+        return "⚠️ member (not admin)"
+    return "❌ bot not in chat"
 
 
 _bot_admin_cache = {}
 
 
-async def bot_is_admin(context, chat_id):
+async def bot_is_admin(bot, chat_id):
     ts, val = _bot_admin_cache.get(chat_id, (0, False))
     if time.time() - ts < 300:
         return val
     try:
-        cm = await context.bot.get_chat_member(chat_id, context.bot.id)
+        cm = await bot.get_chat_member(chat_id, bot.id)
         val = cm.status in ("administrator", "creator")
     except Exception:
         val = False
@@ -226,967 +331,652 @@ async def bot_is_admin(context, chat_id):
     return val
 
 
-def group_only(func):
-    @functools.wraps(func)
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.effective_chat.type not in GROUPS:
-            await update.effective_message.reply_text("This command works only in groups.")
-            return
-        return await func(update, context)
-    return wrapper
-
-
-async def get_target(update, context):
-    m = update.effective_message
-    args = list(context.args or [])
-    if m.reply_to_message and m.reply_to_message.from_user:
-        u = m.reply_to_message.from_user
-        return u.id, u, args
-    if args and args[0].isdigit():
-        uid = int(args[0])
-        try:
-            u = (await context.bot.get_chat_member(m.chat_id, uid)).user
-        except Exception:
-            u = None
-        return uid, u, args[1:]
-    return None, None, args
-
-
-def who(uid, u):
-    return mention(u) if u else f"<code>{uid}</code>"
-
-
-async def prep(update, context, usage, protect=True):
-    m = update.effective_message
-    uid, u, args = await get_target(update, context)
-    if uid is None:
-        await m.reply_text(usage)
-        return None
-    if protect:
-        if uid == context.bot.id:
-            await m.reply_text("I can't do that to myself 🙂")
-            return None
-        if await is_admin(context, m.chat_id, uid):
-            await m.reply_text("❌ This does not work on admins.")
-            return None
-    return uid, u, args
-
-
-def say(m, text, **kw):
-    return m.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True, **kw)
-
-
-# ----------------------------------------------------------------- basics
-HELP = """<b>🤖 GroupHelp Bot</b>
-
-<b>Basic</b>
-/id /ping /rules /notes /get &lt;name&gt; /whois
-
-<b>Admin – Moderation</b>
-/ban /unban /kick /mute /unmute (reply ya user-id)
-/mute 10m ya /mute &lt;id&gt; 2h (s/m/h/d)
-/warn /unwarn /warns /resetwarns /setwarnlimit &lt;n&gt;
-/del (reply) /purge (reply) /pin /unpin /admins
-
-<b>Welcome / Rules</b>
-/setwelcome &lt;text&gt; /welcome on|off
-/setgoodbye &lt;text&gt; /goodbye on|off
-/setrules &lt;text&gt; /clearrules
-Placeholders: {mention} {first} {id} {username} {chat}
-
-<b>Notes / Filters / Blacklist</b>
-/save &lt;name&gt; &lt;text&gt; /clear &lt;name&gt; (use: #name)
-/filter &lt;word&gt; &lt;reply&gt; /stop &lt;word&gt; /filters
-/addblacklist &lt;word&gt; /unblacklist &lt;word&gt; /blacklist
-
-<b>Locks / Flood</b>
-/lock &lt;type&gt; /unlock &lt;type&gt; /locks
-types: link sticker photo video document voice gif forward contact poll
-/setflood &lt;n&gt; (0 = off)
-
-<i>Wrong Format Guard is configured by the owner in private chat.</i>"""
-
-
-OWNER_HELP = """<b>🔒 Owner Panel (private chat only)</b>
-
-These settings apply to <b>every group where this bot is admin</b>.
-
-<b>🔢 Wrong Format Guard</b>
-/setformat on|off
-/setwrong &lt;message&gt;
-/addcmd &lt;line&gt;  /delcmd &lt;no&gt;  /setcmds &lt;lines&gt;  /clearcmds  /cmds
-/setrange &lt;min&gt; &lt;max&gt;  (default 7 12)
-/formatmode pure|contains
-/formatadmin on|off  (exempt group admins)
-/formatdelete on|off
-/formatautodel &lt;sec&gt;  (0 = keep reply)
-/formatstatus
-
-Placeholders for /setwrong: {mention} {first} {id} {username} {chat} {commands}
-
-<b>Example</b>
-/setwrong ❌ Wrong Format! Use only these commands:
-/setcmds /like region uid - free likes
-/info uid - player info
-/setformat on
-
-Group moderation commands (ban, mute, warn, locks, notes...) are used inside groups. Send /help in a group to see them."""
-
-
-async def start(update, context):
-    m = update.effective_message
-    if update.effective_chat.type == ChatType.PRIVATE:
-        if update.effective_user.id == OWNER_ID:
-            await say(m, OWNER_HELP)
-        else:
-            await m.reply_text("🔒 This is a private bot.")
-        return
-    await say(m, "👋 I am a group management bot. Make me an <b>admin</b> in your group (with Delete messages and Ban users rights) and check /help.")
-
-
-async def help_cmd(update, context):
-    m = update.effective_message
-    if update.effective_chat.type == ChatType.PRIVATE:
-        if update.effective_user.id == OWNER_ID:
-            await say(m, OWNER_HELP)
-        else:
-            await m.reply_text("🔒 This is a private bot.")
-        return
-    await say(m, HELP)
-
-
-async def ping(update, context):
-    t = time.time()
-    msg = await update.effective_message.reply_text("🏓")
-    await msg.edit_text(f"🏓 Pong! {int((time.time() - t) * 1000)} ms")
-
-
-async def id_cmd(update, context):
-    m, chat, u = update.effective_message, update.effective_chat, update.effective_user
-    t = f"👤 Your ID: <code>{u.id}</code>\n💬 Chat ID: <code>{chat.id}</code>"
-    if m.reply_to_message and m.reply_to_message.from_user:
-        t += f"\n↩️ Replied user ID: <code>{m.reply_to_message.from_user.id}</code>"
-    await say(m, t)
-
-
-async def whois(update, context):
-    m = update.effective_message
-    uid, u, _ = await get_target(update, context)
-    if uid is None:
-        u = update.effective_user
-        uid = u.id
-    t = f"👤 {who(uid, u)}\n🆔 <code>{uid}</code>"
-    if u and u.username:
-        t += f"\n🔗 @{esc(u.username)}"
-    if update.effective_chat.type in GROUPS:
-        t += f"\n⭐ Admin: {'Yes' if await is_admin(context, m.chat_id, uid) else 'No'}"
-    await say(m, t)
-
-
-@group_only
-async def admins(update, context):
-    m = update.effective_message
-    lst = await context.bot.get_chat_administrators(m.chat_id)
-    lines = [f"• {mention(a.user)}{' 👑' if a.status == 'creator' else ''}" for a in lst if not a.user.is_bot]
-    await say(m, "<b>Admins</b>\n" + "\n".join(lines))
-
-
-# ----------------------------------------------------------------- moderation
-async def _fail(m, e):
-    await m.reply_text(f"❌ Failed: {e}\n(Make the bot admin and give it the required rights)")
-
-
-@admin_cmd
-async def ban(update, context):
-    m = update.effective_message
-    r = await prep(update, context, "Usage: /ban (reply ya user-id)")
-    if not r:
-        return
-    uid, u, _ = r
+async def check_bot_access(bot, chat):
+    """The bot must be an admin of the required channel, otherwise it cannot verify members."""
     try:
-        await context.bot.ban_chat_member(m.chat_id, uid)
-        await say(m, f"🔨 Banned {who(uid, u)}")
+        target = int(chat) if str(chat).lstrip("-").isdigit() else chat
+        member = await bot.get_chat_member(target, bot.id)
+        if member.status not in ("administrator", "creator"):
+            return False, ("Bot is not admin in that channel. Make the bot admin first, "
+                           "then send the channel @username or ID again.")
+        return True, ""
     except Exception as e:
-        await _fail(m, e)
+        log.warning("Channel access check failed for %s: %s", chat, e)
+        return False, ("Cannot access that channel. Check the @username / ID and make sure "
+                       "the bot is admin there. Send it again.")
 
 
-@admin_cmd
-async def unban(update, context):
-    m = update.effective_message
-    r = await prep(update, context, "Usage: /unban (reply ya user-id)", protect=False)
-    if not r:
-        return
-    uid, u, _ = r
+# ----------------------------------------------------------------- REQUIRED CHANNELS (JOIN GATE)
+async def is_member_of(bot, chat, user_id):
     try:
-        await context.bot.unban_chat_member(m.chat_id, uid, only_if_banned=True)
-        await say(m, f"✅ Unbanned {who(uid, u)}")
+        target = int(chat) if str(chat).lstrip("-").isdigit() else chat
+        m = await bot.get_chat_member(target, user_id)
     except Exception as e:
-        await _fail(m, e)
-
-
-@admin_cmd
-async def kick(update, context):
-    m = update.effective_message
-    r = await prep(update, context, "Usage: /kick (reply ya user-id)")
-    if not r:
-        return
-    uid, u, _ = r
-    try:
-        await context.bot.ban_chat_member(m.chat_id, uid)
-        await context.bot.unban_chat_member(m.chat_id, uid, only_if_banned=True)
-        await say(m, f"👢 Kicked {who(uid, u)}")
-    except Exception as e:
-        await _fail(m, e)
-
-
-@admin_cmd
-async def mute(update, context):
-    m = update.effective_message
-    r = await prep(update, context, "Usage: /mute [10m|2h|1d] (reply ya user-id)")
-    if not r:
-        return
-    uid, u, args = r
-    secs = parse_dur(args[0]) if args else None
-    until = datetime.now(timezone.utc) + timedelta(seconds=secs) if secs else None
-    try:
-        await context.bot.restrict_chat_member(m.chat_id, uid, ChatPermissions(can_send_messages=False),
-                                               until_date=until)
-        await say(m, f"🔇 Muted {who(uid, u)}" + (f" for {args[0]}" if secs else ""))
-    except Exception as e:
-        await _fail(m, e)
-
-
-FULL = ChatPermissions(can_send_messages=True, can_send_audios=True, can_send_documents=True,
-                       can_send_photos=True, can_send_videos=True, can_send_video_notes=True,
-                       can_send_voice_notes=True, can_send_polls=True, can_send_other_messages=True,
-                       can_add_web_page_previews=True, can_invite_users=True)
-
-
-@admin_cmd
-async def unmute(update, context):
-    m = update.effective_message
-    r = await prep(update, context, "Usage: /unmute (reply ya user-id)", protect=False)
-    if not r:
-        return
-    uid, u, _ = r
-    try:
-        await context.bot.restrict_chat_member(m.chat_id, uid, FULL)
-        await say(m, f"🔊 Unmuted {who(uid, u)}")
-    except Exception as e:
-        await _fail(m, e)
-
-
-@admin_cmd
-async def warn(update, context):
-    m = update.effective_message
-    r = await prep(update, context, "Usage: /warn [reason] (reply ya user-id)")
-    if not r:
-        return
-    uid, u, args = r
-    doc = await store.get(m.chat_id)
-    n = doc["warns"].get(str(uid), 0) + 1
-    lim = doc["warn_limit"]
-    reason = " ".join(args)
-    if n >= lim:
-        doc["warns"].pop(str(uid), None)
-        await store.save(m.chat_id)
-        try:
-            await context.bot.ban_chat_member(m.chat_id, uid)
-            await say(m, f"🚫 {who(uid, u)} reached {lim}/{lim} warns and was banned.")
-        except Exception as e:
-            await _fail(m, e)
-        return
-    doc["warns"][str(uid)] = n
-    await store.save(m.chat_id)
-    await say(m, f"⚠️ {who(uid, u)} warned ({n}/{lim})" + (f"\nReason: {esc(reason)}" if reason else ""))
-
-
-@admin_cmd
-async def unwarn(update, context):
-    m = update.effective_message
-    r = await prep(update, context, "Usage: /unwarn (reply ya user-id)", protect=False)
-    if not r:
-        return
-    uid, u, _ = r
-    doc = await store.get(m.chat_id)
-    n = doc["warns"].get(str(uid), 0)
-    if n <= 1:
-        doc["warns"].pop(str(uid), None)
-    else:
-        doc["warns"][str(uid)] = n - 1
-    await store.save(m.chat_id)
-    await say(m, f"✅ Removed one warn from {who(uid, u)}.")
-
-
-@group_only
-async def warns_cmd(update, context):
-    m = update.effective_message
-    uid, u, _ = await get_target(update, context)
-    if uid is None:
-        u = update.effective_user
-        uid = u.id
-    doc = await store.get(m.chat_id)
-    await say(m, f"⚠️ {who(uid, u)}: {doc['warns'].get(str(uid), 0)}/{doc['warn_limit']} warns")
-
-
-@admin_cmd
-async def resetwarns(update, context):
-    m = update.effective_message
-    r = await prep(update, context, "Usage: /resetwarns (reply ya user-id)", protect=False)
-    if not r:
-        return
-    uid, u, _ = r
-    doc = await store.get(m.chat_id)
-    doc["warns"].pop(str(uid), None)
-    await store.save(m.chat_id)
-    await say(m, f"✅ All warns reset for {who(uid, u)}.")
-
-
-@admin_cmd
-async def setwarnlimit(update, context):
-    m = update.effective_message
-    a = context.args
-    if not a or not a[0].isdigit() or not (1 <= int(a[0]) <= 20):
-        await m.reply_text("Usage: /setwarnlimit 3  (1-20)")
-        return
-    doc = await store.get(m.chat_id)
-    doc["warn_limit"] = int(a[0])
-    await store.save(m.chat_id)
-    await m.reply_text(f"✅ Warn limit = {a[0]}")
-
-
-@admin_cmd
-async def del_cmd(update, context):
-    m = update.effective_message
-    if not m.reply_to_message:
-        await m.reply_text("Reply to the message you want to delete with /del.")
-        return
-    try:
-        await m.reply_to_message.delete()
-        await m.delete()
-    except Exception as e:
-        await _fail(m, e)
-
-
-@admin_cmd
-async def purge(update, context):
-    m = update.effective_message
-    if not m.reply_to_message:
-        await m.reply_text("Reply to the message you want to purge from with /purge.")
-        return
-    ids = list(range(m.reply_to_message.message_id, m.message_id + 1))
-    try:
-        for i in range(0, len(ids), 100):
-            await context.bot.delete_messages(m.chat_id, ids[i:i + 100])
-        note = await context.bot.send_message(m.chat_id, f"🧹 Purged {len(ids)} messages.")
-        later(_del_after(note, 5))
-    except Exception as e:
-        await _fail(m, e)
-
-
-@admin_cmd
-async def pin(update, context):
-    m = update.effective_message
-    if not m.reply_to_message:
-        await m.reply_text("Reply to the message you want to pin.")
-        return
-    try:
-        await m.reply_to_message.pin()
-    except Exception as e:
-        await _fail(m, e)
-
-
-@admin_cmd
-async def unpin(update, context):
-    m = update.effective_message
-    try:
-        if m.reply_to_message:
-            await context.bot.unpin_chat_message(m.chat_id, m.reply_to_message.message_id)
-        else:
-            await context.bot.unpin_chat_message(m.chat_id)
-        await m.reply_text("📌 Unpinned.")
-    except Exception as e:
-        await _fail(m, e)
-
-
-# ----------------------------------------------------------------- welcome / rules
-def _toggle_arg(args):
-    if args and args[0].lower() in ("on", "yes", "true", "1"):
+        # Misconfigured channel (bot removed / not admin): do not lock everybody out.
+        log.warning("Membership check failed for %s: %s", chat, e)
         return True
-    if args and args[0].lower() in ("off", "no", "false", "0"):
-        return False
-    return None
-
-
-def make_text_setter(key, label):
-    @admin_cmd
-    async def setter(update, context):
-        m = update.effective_message
-        txt = rest(m) or (m.reply_to_message.text if m.reply_to_message and m.reply_to_message.text else "")
-        if not txt:
-            await m.reply_text(f"Usage: /set{key} <text>\nPlaceholders: {{mention}} {{first}} {{id}} {{username}} {{chat}}")
-            return
-        doc = await store.get(m.chat_id)
-        doc[key]["text"] = txt
-        await store.save(m.chat_id)
-        await m.reply_text(f"✅ {label} message set.")
-    return setter
-
-
-def make_toggle(key, label):
-    @admin_cmd
-    async def toggle(update, context):
-        m = update.effective_message
-        v = _toggle_arg(context.args)
-        if v is None:
-            await m.reply_text(f"Usage: /{key} on|off")
-            return
-        doc = await store.get(m.chat_id)
-        doc[key]["on"] = v
-        await store.save(m.chat_id)
-        await m.reply_text(f"✅ {label} {'ON' if v else 'OFF'}")
-    return toggle
-
-
-setwelcome = make_text_setter("welcome", "Welcome")
-setgoodbye = make_text_setter("goodbye", "Goodbye")
-welcome_toggle = make_toggle("welcome", "Welcome")
-goodbye_toggle = make_toggle("goodbye", "Goodbye")
-
-
-async def on_join(update, context):
-    m, chat = update.effective_message, update.effective_chat
-    doc = await store.get(chat.id)
-    if not doc["welcome"]["on"]:
-        return
-    for u in m.new_chat_members:
-        if u.is_bot:
-            continue
-        try:
-            await say(m, render(doc["welcome"]["text"], u, chat))
-        except Exception:
-            pass
-
-
-async def on_leave(update, context):
-    m, chat = update.effective_message, update.effective_chat
-    doc = await store.get(chat.id)
-    u = m.left_chat_member
-    if doc["goodbye"]["on"] and u and not u.is_bot:
-        try:
-            await say(m, render(doc["goodbye"]["text"], u, chat))
-        except Exception:
-            pass
-
-
-@group_only
-async def rules(update, context):
-    m = update.effective_message
-    doc = await store.get(m.chat_id)
-    await say(m, "📜 <b>Rules</b>\n" + esc(doc["rules"]) if doc["rules"] else "No rules have been set yet.")
-
-
-@admin_cmd
-async def setrules(update, context):
-    m = update.effective_message
-    txt = rest(m)
-    if not txt:
-        await m.reply_text("Usage: /setrules <text>")
-        return
-    doc = await store.get(m.chat_id)
-    doc["rules"] = txt
-    await store.save(m.chat_id)
-    await m.reply_text("✅ Rules saved.")
-
-
-@admin_cmd
-async def clearrules(update, context):
-    doc = await store.get(update.effective_chat.id)
-    doc["rules"] = ""
-    await store.save(update.effective_chat.id)
-    await update.effective_message.reply_text("✅ Rules cleared.")
-
-
-# ----------------------------------------------------------------- notes / filters / blacklist
-NOTE_RE = re.compile(r"^[\w-]{1,32}$")
-
-
-def payload(m, skip_words=1):
-    parts = (m.text or "").split(None, skip_words + 0)
-    text = parts[skip_words] if len(parts) > skip_words else ""
-    if not text and m.reply_to_message:
-        text = m.reply_to_message.text or m.reply_to_message.caption or ""
-    return text
-
-
-@admin_cmd
-async def save(update, context):
-    m = update.effective_message
-    if not context.args or not NOTE_RE.match(context.args[0]):
-        await m.reply_text("Usage: /save <name> <text>  (ya reply karke /save <name>)")
-        return
-    parts = (m.text or "").split(None, 2)
-    text = parts[2] if len(parts) > 2 else (
-        (m.reply_to_message.text or m.reply_to_message.caption or "") if m.reply_to_message else "")
-    if not text:
-        await m.reply_text("Please give the note text too.")
-        return
-    doc = await store.get(m.chat_id)
-    doc["notes"][context.args[0].lower()] = text
-    await store.save(m.chat_id)
-    await m.reply_text(f"✅ Saved. Use: #{context.args[0].lower()} ya /get {context.args[0].lower()}")
-
-
-@group_only
-async def get_note(update, context):
-    m = update.effective_message
-    if not context.args:
-        await m.reply_text("Usage: /get <name>")
-        return
-    doc = await store.get(m.chat_id)
-    t = doc["notes"].get(context.args[0].lower())
-    await (say(m, esc(t)) if t else m.reply_text("No such note."))
-
-
-@group_only
-async def notes_cmd(update, context):
-    doc = await store.get(update.effective_chat.id)
-    n = sorted(doc["notes"])
-    await say(update.effective_message,
-              "<b>Notes</b>\n" + "\n".join(f"• #{esc(x)}" for x in n) if n else "No notes saved.")
-
-
-@admin_cmd
-async def clear_note(update, context):
-    m = update.effective_message
-    doc = await store.get(m.chat_id)
-    if context.args and doc["notes"].pop(context.args[0].lower(), None) is not None:
-        await store.save(m.chat_id)
-        await m.reply_text("✅ Note deleted.")
-    else:
-        await m.reply_text("Usage: /clear <name>  (note not found)")
-
-
-@admin_cmd
-async def filter_cmd(update, context):
-    m = update.effective_message
-    parts = (m.text or "").split(None, 2)
-    if len(parts) < 2:
-        await m.reply_text("Usage: /filter <word> <reply text>")
-        return
-    reply = parts[2] if len(parts) > 2 else (
-        (m.reply_to_message.text or "") if m.reply_to_message else "")
-    if not reply:
-        await m.reply_text("Please give the reply text too.")
-        return
-    kw = parts[1].lower()
-    doc = await store.get(m.chat_id)
-    doc["filters"] = [f for f in doc["filters"] if f["k"] != kw] + [{"k": kw, "v": reply}]
-    await store.save(m.chat_id)
-    await m.reply_text(f"✅ Filter set: {kw}")
-
-
-@admin_cmd
-async def stop_filter(update, context):
-    m = update.effective_message
-    if not context.args:
-        await m.reply_text("Usage: /stop <word>")
-        return
-    doc = await store.get(m.chat_id)
-    kw = context.args[0].lower()
-    before = len(doc["filters"])
-    doc["filters"] = [f for f in doc["filters"] if f["k"] != kw]
-    await store.save(m.chat_id)
-    await m.reply_text("✅ Removed." if len(doc["filters"]) < before else "No such filter.")
-
-
-@group_only
-async def filters_cmd(update, context):
-    doc = await store.get(update.effective_chat.id)
-    f = [x["k"] for x in doc["filters"]]
-    await say(update.effective_message,
-              "<b>Filters</b>\n" + "\n".join(f"• {esc(x)}" for x in f) if f else "No filters set.")
-
-
-@admin_cmd
-async def addbl(update, context):
-    m = update.effective_message
-    w = rest(m).lower()
-    if not w:
-        await m.reply_text("Usage: /addblacklist <word>")
-        return
-    doc = await store.get(m.chat_id)
-    if w not in doc["blacklist"]:
-        doc["blacklist"].append(w)
-        await store.save(m.chat_id)
-    await m.reply_text(f"✅ Blacklisted: {w}")
-
-
-@admin_cmd
-async def rmbl(update, context):
-    m = update.effective_message
-    w = rest(m).lower()
-    doc = await store.get(m.chat_id)
-    if w in doc["blacklist"]:
-        doc["blacklist"].remove(w)
-        await store.save(m.chat_id)
-        await m.reply_text("✅ Removed.")
-    else:
-        await m.reply_text("Usage: /unblacklist <word>  (word not found)")
-
-
-@group_only
-async def bl_list(update, context):
-    doc = await store.get(update.effective_chat.id)
-    await say(update.effective_message,
-              "<b>Blacklist</b>\n" + "\n".join(f"• {esc(x)}" for x in doc["blacklist"])
-              if doc["blacklist"] else "Blacklist is empty.")
-
-
-# ----------------------------------------------------------------- locks / flood
-LOCKS = ["link", "sticker", "photo", "video", "document", "voice", "gif", "forward", "contact", "poll"]
-LINK_RE = re.compile(r"(https?://|www\.|t\.me/|telegram\.me/)", re.I)
-
-
-def lock_hit(m, locks):
-    ents = list(m.entities or []) + list(m.caption_entities or [])
-    txt = m.text or m.caption or ""
-    checks = {
-        "link": lambda: any(e.type in ("url", "text_link") for e in ents) or bool(LINK_RE.search(txt)),
-        "sticker": lambda: bool(m.sticker),
-        "photo": lambda: bool(m.photo),
-        "video": lambda: bool(m.video or m.video_note),
-        "document": lambda: bool(m.document and not m.animation),
-        "voice": lambda: bool(m.voice or m.audio),
-        "gif": lambda: bool(m.animation),
-        "forward": lambda: bool(m.forward_origin),
-        "contact": lambda: bool(m.contact),
-        "poll": lambda: bool(m.poll),
-    }
-    for name in locks:
-        fn = checks.get(name)
-        if fn and fn():
-            return name
-    return None
-
-
-def make_lock(on):
-    @admin_cmd
-    async def lock(update, context):
-        m = update.effective_message
-        t = (context.args[0].lower() if context.args else "")
-        if t not in LOCKS:
-            await m.reply_text("Types: " + " ".join(LOCKS))
-            return
-        doc = await store.get(m.chat_id)
-        if on and t not in doc["locks"]:
-            doc["locks"].append(t)
-        if not on and t in doc["locks"]:
-            doc["locks"].remove(t)
-        await store.save(m.chat_id)
-        await m.reply_text(f"{'🔒 Locked' if on else '🔓 Unlocked'}: {t}")
-    return lock
-
-
-lock_cmd, unlock_cmd = make_lock(True), make_lock(False)
-
-
-@group_only
-async def locks_cmd(update, context):
-    doc = await store.get(update.effective_chat.id)
-    await update.effective_message.reply_text(
-        "🔒 Locked: " + (", ".join(doc["locks"]) if doc["locks"] else "none"))
-
-
-@admin_cmd
-async def setflood(update, context):
-    m = update.effective_message
-    a = context.args
-    if not a or not a[0].isdigit():
-        await m.reply_text("Usage: /setflood 6  (mute after 6 messages in 5 seconds; 0 = off)")
-        return
-    doc = await store.get(m.chat_id)
-    doc["flood"] = int(a[0])
-    await store.save(m.chat_id)
-    await m.reply_text("✅ Antiflood " + (f"= {a[0]} msgs / 5s" if int(a[0]) else "OFF"))
-
-
-flood_log = defaultdict(lambda: deque(maxlen=50))
-
-# ----------------------------------------------------------------- WRONG FORMAT GUARD
-SEP_RE = re.compile(r"[\s\-\.,_+()/\u200b\u200c\u200d]")
-RUN_RE = re.compile(r"\d(?:[\d\s\-\.,_()]*\d)?")
-
-
-def bad_number(text, f):
-    t = text.strip()
-    if not t:
-        return False
-    lo, hi = f["min"], f["max"]
-    if f["mode"] == "pure":
-        s = SEP_RE.sub("", t)
-        return bool(s) and s.isdecimal() and lo <= len(s) <= hi
-    for run in RUN_RE.findall(t):
-        n = sum(1 for c in run if c.isdecimal())
-        if lo <= n <= hi:
-            return True
+    if m.status in ("creator", "administrator", "member"):
+        return True
+    if m.status == "restricted":
+        return bool(getattr(m, "is_member", True))
     return False
 
 
-last_fmt = {}
+async def missing_channels(bot, user_id):
+    """Required channels this user has NOT joined yet (fresh check)."""
+    if user_id == OWNER_ID:
+        return []
+    out = []
+    for ch in db.settings["channels"]:
+        if ch.get("chat") and not await is_member_of(bot, ch["chat"], user_id):
+            out.append(ch)
+    return out
 
 
-async def punish_format(update, context, doc):
-    m, chat, user = update.effective_message, update.effective_chat, update.effective_user
-    f = doc["fmt"]
-    if f["delete_msg"]:
-        try:
-            await m.delete()
-        except Exception:
-            pass
-    key = (chat.id, user.id)
-    now = time.time()
-    if now - last_fmt.get(key, 0) < 8:       # anti-spam: no repeated replies
-        return
-    last_fmt[key] = now
-    cmds = "\n".join(esc(c) for c in f["cmds"])
-    msg = render(f["msg"], user, chat, **{"{commands}": cmds})
-    if "{commands}" not in f["msg"] and cmds:
-        msg += "\n\n" + cmds
+def verify_button(user_id, use_icon=True):
+    s = db.settings
+    return btn(s["verify_text"], data=f"v:{user_id}", style=s["verify_color"],
+               icon=(s.get("verify_icon") if use_icon else ""))
+
+
+def join_markup(user_id, missing, use_icon=True):
+    """Only the channels this user has NOT joined, numbered 1, 2, 3... + VERIFY (bound to the user)."""
+    rows = [[btn(channel_button_name(n), url=ch["link"], style=CHANNEL_BUTTON_STYLE)]
+            for n, ch in enumerate(missing, 1)]
+    rows.append([verify_button(user_id, use_icon)])
+    return InlineKeyboardMarkup(rows)
+
+
+async def send_join_prompt(bot, chat_id, user, missing):
+    text = (f"👋 Hello {name_text(user)}\n\n"
+            "⚠️ You must join all required channels to use this group\n\n"
+            "👇 Join the channels below, then tap Verify")
     try:
-        sent = await context.bot.send_message(chat.id, msg, parse_mode=ParseMode.HTML,
-                                              disable_web_page_preview=True)
-        if f["autodel"] > 0:
-            later(_del_after(sent, f["autodel"]))
-    except Exception:
-        log.exception("format reply failed")
+        return await bot.send_message(chat_id, text, parse_mode="HTML",
+                                      reply_markup=join_markup(user.id, missing))
+    except BadRequest as e:
+        if not db.settings.get("verify_icon"):
+            raise
+        # Premium emoji icon refused by Telegram: fall back to a normal VERIFY button.
+        log.warning("Join prompt failed with premium icon, retrying without it: %s", e)
+        return await bot.send_message(chat_id, text, parse_mode="HTML",
+                                      reply_markup=join_markup(user.id, missing, use_icon=False))
 
 
-@owner_dm
-async def setformat(update, context):
-    m = update.effective_message
-    v = _toggle_arg(context.args)
-    if v is None:
-        await m.reply_text("Usage: /setformat on|off")
-        return
-    doc = await store.get(GLOBAL)
-    doc["fmt"]["on"] = v
-    await store.save(GLOBAL)
-    await m.reply_text(f"✅ Wrong Format guard {'ON ✅' if v else 'OFF ⛔'}")
-
-
-@owner_dm
-async def setwrong(update, context):
-    m = update.effective_message
-    txt = rest(m) or (m.reply_to_message.text if m.reply_to_message and m.reply_to_message.text else "")
-    if not txt:
-        await m.reply_text("Usage: /setwrong <message>\nPlaceholders: {mention} {first} {id} {username} {chat} {commands}\n"
-                           "If you do not write {commands}, your commands list is added at the bottom automatically.")
-        return
-    doc = await store.get(GLOBAL)
-    doc["fmt"]["msg"] = txt
-    await store.save(GLOBAL)
-    await m.reply_text("✅ Wrong Format message set.")
-
-
-@owner_dm
-async def addcmd(update, context):
-    m = update.effective_message
-    line = rest(m)
-    if not line:
-        await m.reply_text("Usage: /addcmd /like region uid - free likes")
-        return
-    doc = await store.get(GLOBAL)
-    doc["fmt"]["cmds"].append(line)
-    await store.save(GLOBAL)
-    await m.reply_text(f"✅ Added (#{len(doc['fmt']['cmds'])})")
-
-
-@owner_dm
-async def delcmd(update, context):
-    m = update.effective_message
-    doc = await store.get(GLOBAL)
-    a = context.args
-    if not a or not a[0].isdigit() or not (1 <= int(a[0]) <= len(doc["fmt"]["cmds"])):
-        await m.reply_text("Usage: /delcmd <number>  (see numbers in /cmds)")
-        return
-    doc["fmt"]["cmds"].pop(int(a[0]) - 1)
-    await store.save(GLOBAL)
-    await m.reply_text("✅ Removed.")
-
-
-@owner_dm
-async def setcmds(update, context):
-    m = update.effective_message
-    lines = [x.strip() for x in rest(m).splitlines() if x.strip()]
-    if not lines:
-        await m.reply_text("Usage:\n/setcmds /like region uid - free likes\n/info uid - player info\n(one command per line)")
-        return
-    doc = await store.get(GLOBAL)
-    doc["fmt"]["cmds"] = lines
-    await store.save(GLOBAL)
-    await m.reply_text(f"✅ {len(lines)} commands set.")
-
-
-@owner_dm
-async def clearcmds(update, context):
-    doc = await store.get(GLOBAL)
-    doc["fmt"]["cmds"] = []
-    await store.save(GLOBAL)
-    await update.effective_message.reply_text("✅ Commands list cleared.")
-
-
-@owner_dm
-async def cmds_cmd(update, context):
-    doc = await store.get(GLOBAL)
-    c = doc["fmt"]["cmds"]
-    await update.effective_message.reply_text(
-        "\n".join(f"{i}. {x}" for i, x in enumerate(c, 1)) if c else "No commands set. Add them with /addcmd or /setcmds.")
-
-
-@owner_dm
-async def setrange(update, context):
-    m = update.effective_message
-    a = context.args
-    if len(a) != 2 or not all(x.isdigit() for x in a) or not (1 <= int(a[0]) <= int(a[1]) <= 40):
-        await m.reply_text("Usage: /setrange 7 12")
-        return
-    doc = await store.get(GLOBAL)
-    doc["fmt"]["min"], doc["fmt"]["max"] = int(a[0]), int(a[1])
-    await store.save(GLOBAL)
-    await m.reply_text(f"✅ Range: {a[0]}–{a[1]} digits")
-
-
-@owner_dm
-async def formatmode(update, context):
-    m = update.effective_message
-    if not context.args or context.args[0].lower() not in ("pure", "contains"):
-        await m.reply_text("Usage: /formatmode pure|contains\npure = message that is only a number\ncontains = number anywhere in the message")
-        return
-    doc = await store.get(GLOBAL)
-    doc["fmt"]["mode"] = context.args[0].lower()
-    await store.save(GLOBAL)
-    await m.reply_text(f"✅ Mode: {context.args[0].lower()}")
-
-
-def make_fmt_flag(cmd, key, label):
-    @owner_dm
-    async def flag(update, context):
-        m = update.effective_message
-        v = _toggle_arg(context.args)
-        if v is None:
-            await m.reply_text(f"Usage: /{cmd} on|off")
-            return
-        doc = await store.get(GLOBAL)
-        doc["fmt"][key] = v
-        await store.save(GLOBAL)
-        await m.reply_text(f"✅ {label}: {'ON' if v else 'OFF'}")
-    return flag
-
-
-formatadmin = make_fmt_flag("formatadmin", "exempt_admins", "Admins exempt")
-formatdelete = make_fmt_flag("formatdelete", "delete_msg", "Delete user's number message")
-
-
-@owner_dm
-async def formatautodel(update, context):
-    m = update.effective_message
-    a = context.args
-    if not a or not a[0].isdigit():
-        await m.reply_text("Usage: /formatautodel 15  (seconds, 0 = keep the message)")
-        return
-    doc = await store.get(GLOBAL)
-    doc["fmt"]["autodel"] = int(a[0])
-    await store.save(GLOBAL)
-    await m.reply_text(f"✅ Auto-delete: {a[0]}s")
-
-
-@owner_dm
-async def formatstatus(update, context):
-    doc = await store.get(GLOBAL)
-    f = doc["fmt"]
-    t = (f"<b>🔢 Wrong Format Guard</b>\n"
-         f"Status: {'ON ✅' if f['on'] else 'OFF ⛔'}\n"
-         f"Range: {f['min']}–{f['max']} digits\nMode: {f['mode']}\n"
-         f"Admins exempt: {f['exempt_admins']}\nDelete number msg: {f['delete_msg']}\n"
-         f"Auto-delete reply: {f['autodel']}s\n\n"
-         f"<b>Message:</b>\n{esc(f['msg'])}\n\n<b>Commands ({len(f['cmds'])}):</b>\n"
-         + ("\n".join(esc(c) for c in f["cmds"]) or "—"))
-    await say(update.effective_message, t)
-
-
-# ----------------------------------------------------------------- main watcher
-async def watcher(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def gate_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Runs on every message in the owner's groups."""
     m, chat, user = update.effective_message, update.effective_chat, update.effective_user
-    if not m or not user or user.is_bot or chat.type not in GROUPS:
+    if not m or not user or user.is_bot or m.sender_chat or getattr(m, "is_automatic_forward", False):
         return
-    doc = await store.get(chat.id)
-    text = m.text or m.caption or ""
-
-    async def admin():
-        return await is_admin(context, chat.id, user.id, m)
-
-    # 1) Wrong Format guard
-    gdoc = await store.get(GLOBAL)
-    f = gdoc["fmt"]
-    if f["on"] and text and bad_number(text, f) and await bot_is_admin(context, chat.id):
-        if not (f["exempt_admins"] and await is_admin(context, chat.id, user.id, m, owner_bypass=False)):
-            await punish_format(update, context, gdoc)
+    g = db.groups.get(str(chat.id))
+    if not g or not g.get("gate", True):
+        return
+    s = db.settings
+    if not s["channels"] or user.id == OWNER_ID:
+        return
+    if time.time() - joined_cache.get(user.id, 0) < JOINED_CACHE_SECONDS:
+        return
+    if not await bot_is_admin(context.bot, chat.id):
+        return
+    missing = await missing_channels(context.bot, user.id)
+    if not missing:
+        joined_cache[user.id] = time.time()
+        return
+    try:     # group admins are never blocked
+        cm = await context.bot.get_chat_member(chat.id, user.id)
+        if cm.status in ("administrator", "creator"):
             return
-
-    # 2) locks
-    hit = lock_hit(m, doc["locks"]) if doc["locks"] else None
-    if hit and not await admin():
+    except Exception:
+        pass
+    if s["delete_msg"]:
         try:
             await m.delete()
         except Exception:
             pass
+    old = prompts.get((chat.id, user.id))
+    if old and time.time() - old[1] < PROMPT_SECONDS:
+        return        # this user already has a join message waiting
+    try:
+        sent = await send_join_prompt(context.bot, chat.id, user, missing)
+        prompts[(chat.id, user.id)] = (sent.message_id, time.time())
+    except Exception:
+        log.exception("could not send join prompt")
+
+
+async def on_verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    try:
+        target = int((q.data or "").split(":", 1)[1])
+    except (ValueError, IndexError):
+        await q.answer()
         return
-
-    # 3) blacklist
-    if text and doc["blacklist"]:
-        low = text.lower()
-        if any(re.search(r"(?<!\w)" + re.escape(w) + r"(?!\w)", low) for w in doc["blacklist"]):
-            if not await admin():
-                try:
-                    await m.delete()
-                except Exception:
-                    pass
-                return
-
-    # 4) antiflood
-    if doc["flood"] > 0 and not m.edit_date:
-        dq = flood_log[(chat.id, user.id)]
-        now = time.time()
-        dq.append(now)
-        recent = [t for t in dq if now - t <= 5]
-        if len(recent) >= doc["flood"] and not await admin():
-            dq.clear()
+    if q.from_user.id != target:       # only the user this prompt was made for
+        await q.answer("❌ This button is not for you.", show_alert=True)
+        return
+    joined_cache.pop(target, None)
+    missing = await missing_channels(context.bot, target)
+    if missing:
+        try:
             try:
-                await context.bot.restrict_chat_member(
-                    chat.id, user.id, ChatPermissions(can_send_messages=False),
-                    until_date=datetime.now(timezone.utc) + timedelta(minutes=5))
-                await say(m, f"🌊 Flood! {mention(user)} muted for 5 minutes.")
-            except Exception:
-                pass
-            return
+                await q.edit_message_reply_markup(reply_markup=join_markup(target, missing))
+            except BadRequest as e:
+                if "not modified" in str(e).lower() or not db.settings.get("verify_icon"):
+                    raise
+                await q.edit_message_reply_markup(reply_markup=join_markup(target, missing, use_icon=False))
+        except BadRequest as e:
+            if "not modified" not in str(e).lower():
+                log.warning("Verify refresh failed: %s", e)
+        await q.answer("❌ You have not joined all required channels yet.", show_alert=True)
+        return
+    joined_cache[target] = time.time()
+    prompts.pop((q.message.chat.id, target), None)
+    await q.answer("✅ Verified successfully")
+    try:
+        await q.edit_message_text(
+            f"👋 Hello {name_text(q.from_user)}\n\n🎉 Welcome to {escape(q.message.chat.title or 'the group')}\n\n"
+            "❤️ Thank you for joining all the required channels\n\n"
+            "✅ You are verified. Now you can use this group",
+            parse_mode="HTML")
+        later(_del_after(q.message, 10))
+    except Exception:
+        pass
 
-    if m.edit_date or not text:
+
+# ----------------------------------------------------------------- group list helpers
+def save_group(chat):
+    gid = str(chat.id)
+    old = db.groups.get(gid, {})
+    new = gid not in db.groups
+    db.groups[gid] = {"title": chat.title or gid, "type": chat.type,
+                      "added": old.get("added", int(time.time())), "gate": old.get("gate", True)}
+    db.save()
+    return new
+
+
+def replace_group(old_gid, chat):
+    """Swap one group for another, keeping its position and gate setting."""
+    keep_gate = db.groups.get(old_gid, {}).get("gate", True)
+    new_gid = str(chat.id)
+    items = list(db.groups.items())
+    db.groups.clear()
+    for k, v in items:
+        if k == old_gid:
+            db.groups[new_gid] = {"title": chat.title or new_gid, "type": chat.type,
+                                  "added": v.get("added", int(time.time())), "gate": keep_gate}
+        elif k != new_gid:
+            db.groups[k] = v
+    db.save()
+
+
+def new_channel(link, chat):
+    ch = {"id": uuid.uuid4().hex[:8], "link": link, "chat": chat}
+    db.settings["channels"].append(ch)
+    db.save()
+    joined_cache.clear()
+    return ch
+
+
+def find_channel(cid):
+    return next((c for c in db.settings["channels"] if c["id"] == cid), None)
+
+
+def channel_number(cid):
+    return next((i for i, c in enumerate(db.settings["channels"], 1) if c["id"] == cid), 0)
+
+
+# ----------------------------------------------------------------- panels (owner, buttons only)
+def onoff(v):
+    return "ON ✅" if v else "OFF ⛔"
+
+
+def main_panel():
+    s = db.settings
+    text = (
+        "⚙️ <b>Control Panel</b>\n\n"
+        f"📋 <b>Groups:</b> {len(db.groups)}\n"
+        f"📢 <b>Required Channels:</b> {len(s['channels'])}\n"
+        f"✅ <b>Verify Button</b> ({COLOR_LABELS[s['verify_color']]}): <code>{escape(s['verify_text'])}</code>\n"
+        f"🗑 <b>Delete Unjoined User's Message:</b> {onoff(s['delete_msg'])}\n\n"
+        "Choose what you want to do:")
+    m = InlineKeyboardMarkup([
+        [btn("📋 My Groups", data="m:groups", style="primary"), btn("➕ Add Group", data="m:addg", style="success")],
+        [btn("📢 Required Channels", data="a:chs", style="primary")],
+        [btn("✅ Verify Button Settings", data="a:v", style="success")],
+        [btn(f"🗑 Delete Unjoined Msg: {onoff(s['delete_msg'])}", data="a:delmsg")],
+        [btn("❌ Close", data="m:close", style="danger")],
+    ])
+    return text, m
+
+
+async def groups_panel(bot):
+    if db.groups:
+        lines = []
+        for i, (gid, g) in enumerate(db.groups.items(), 1):
+            st = await bot_status(bot, int(gid))
+            lines.append(f"<b>{i}.</b> {escape(g['title'])}\n    {st} · Gate {onoff(g.get('gate', True))}")
+        body = "\n".join(lines)
+    else:
+        body = "No groups added yet."
+    text = "📋 <b>My Groups</b>\nTap a group to control it.\n\n" + body
+    rows = [[btn(f"{i}. {g['title'][:30]}", data=f"g:{gid}", style="primary")]
+            for i, (gid, g) in enumerate(db.groups.items(), 1)]
+    rows.append([btn("➕ Add Group", data="m:addg", style="success")])
+    rows.append([btn("⬅️ Back", data="m:main")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def group_panel(bot, gid):
+    g = db.groups.get(gid)
+    if not g:
+        return await groups_panel(bot)
+    st = await bot_status(bot, int(gid))
+    n = len(db.settings["channels"])
+    warn = "" if n else "\n⚠️ No required channels yet, so the gate does nothing. Add them in 📢 Required Channels."
+    text = (f"📋 <b>{escape(g['title'])}</b>\n\n<code>{gid}</code>\n"
+            f"Bot: {st}\n🔒 <b>Join Gate:</b> {onoff(g.get('gate', True))}\n"
+            f"📢 <b>Required Channels:</b> {n}{warn}")
+    m = InlineKeyboardMarkup([
+        [btn(f"🔒 Join Gate: {onoff(g.get('gate', True))}", data=f"gt:{gid}", style="success" if g.get("gate", True) else "danger")],
+        [btn("✏️ Change Group", data=f"ge:{gid}", style="primary"), btn("🗑 Delete", data=f"gd:{gid}", style="danger")],
+        [btn("⬅️ Back", data="m:groups")],
+    ])
+    return text, m
+
+
+def channels_panel():
+    chans = db.settings["channels"]
+    if chans:
+        lines = "\n".join(f"{i}. {channel_button_name(i)} — <code>{escape(c['chat'] or '-')}</code>"
+                          for i, c in enumerate(chans, 1))
+    else:
+        lines = "No channels added yet."
+    text = ("📢 <b>Required Channels</b>\n"
+            "Users must join all of these to use your groups.\n"
+            "⚠️ The bot must be admin in every channel.\n"
+            "🔒 Button name / colour are fixed. You can only add or delete.\n\n" + lines)
+    rows = [[btn("📢 " + channel_button_name(i), data=f"c:{c['id']}", style=CHANNEL_BUTTON_STYLE)]
+            for i, c in enumerate(chans, 1)]
+    if len(chans) < MAX_CHANNELS:
+        rows.append([btn("➕ Add Channel", data="a:chadd", style="success")])
+    rows.append([btn("⬅️ Back", data="m:main")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+def channel_panel(cid):
+    ch = find_channel(cid)
+    if not ch:
+        return channels_panel()
+    text = ("📢 <b>Channel Button</b>\n\n"
+            f"Name: {channel_button_name(channel_number(cid))}\n"
+            f"Link: <code>{escape(ch['link'])}</code>\n"
+            f"Channel ID/Username: <code>{escape(ch['chat'] or 'Not Set')}</code>\n"
+            f"Colour: {COLOR_LABELS[CHANNEL_BUTTON_STYLE]} (Fixed)")
+    m = InlineKeyboardMarkup([[btn("🗑 Delete Channel", data=f"cd:{cid}", style="danger")],
+                              [btn("⬅️ Back", data="a:chs")]])
+    return text, m
+
+
+def verify_panel():
+    s = db.settings
+    icon = s.get("verify_icon") or ""
+    text = ("✅ <b>Verify Button</b>\n"
+            "Shown under the channel buttons when a user has not joined.\n\n"
+            f"Text: <code>{escape(s['verify_text'])}</code>\n"
+            f"Colour: {COLOR_LABELS[s['verify_color']]}\n"
+            f"💎 Premium Emoji: {'✅ Set' if icon else 'Not Set'}\n\n"
+            "💡 To set a premium emoji: Edit Text, then send a message that has that emoji.")
+    rows = [[btn("✏️ Edit Text", data="a:vtxt", style="success"), btn("🎨 Edit Colour", data="a:vcol", style="success")]]
+    if icon:
+        rows.append([btn("🗑 Remove Premium Emoji", data="a:vico", style="danger")])
+    rows.append([btn("⬅️ Back", data="m:main")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+def color_panel():
+    m = InlineKeyboardMarkup([
+        [btn("🟢 Green", data="col:verify:g", style="success"), btn("🔵 Blue", data="col:verify:b", style="primary"),
+         btn("🔴 Red", data="col:verify:r", style="danger")],
+        [btn("⬅️ Back", data="a:v")]])
+    return "🎨 <b>Choose Button Colour:</b>", m
+
+
+def cancel_markup():
+    return InlineKeyboardMarkup([[btn("⬅️ Cancel", data="m:main")]])
+
+
+async def show(q, panel, prefix=""):
+    text, markup = panel
+    try:
+        await q.edit_message_text(prefix + text, parse_mode="HTML", reply_markup=markup,
+                                  disable_web_page_preview=True)
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():
+            log.error("Panel edit failed: %s", e)
+
+
+async def send_panel(bot, chat_id, panel, prefix=""):
+    text, markup = panel
+    await bot.send_message(chat_id, prefix + text, parse_mode="HTML", reply_markup=markup,
+                           disable_web_page_preview=True)
+
+
+# ----------------------------------------------------------------- owner: buttons
+async def on_owner_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != OWNER_ID or q.message.chat.type != ChatType.PRIVATE:
+        await q.answer("Not authorized.", show_alert=True)
+        return
+    uid, chat_id, bot = q.from_user.id, q.message.chat.id, context.bot
+    parts = (q.data or "").split(":")
+    kind = parts[0]
+    arg = parts[1] if len(parts) > 1 else ""
+    arg2 = parts[2] if len(parts) > 2 else ""
+    sessions.pop(uid, None)
+
+    if kind == "add":        # from "bot was added" notification (group)
+        try:
+            chat = await bot.get_chat(int(arg))
+            new = save_group(chat)
+            await q.answer("Added" if new else "Already in list")
+            await show(q, await group_panel(bot, str(chat.id)), "✅ Group Added\n\n" if new else "")
+        except Exception as e:
+            await q.answer(f"Failed: {e}", show_alert=True)
+        return
+    if kind == "rch":        # from notification (channel) -> required channel
+        await q.answer()
+        try:
+            chat = await bot.get_chat(int(arg))
+        except Exception as e:
+            await bot.send_message(chat_id, f"❌ {escape(str(e))}", parse_mode="HTML")
+            return
+        ok, err = await check_bot_access(bot, str(chat.id))
+        if not ok:
+            await bot.send_message(chat_id, "❌ " + err)
+            return
+        link = f"https://t.me/{chat.username}" if chat.username else ""
+        if not link:
+            try:
+                link = await bot.export_chat_invite_link(chat.id)
+            except Exception:
+                link = ""
+        if link:
+            ch = new_channel(link, str(chat.id))
+            await send_panel(bot, chat_id, channel_panel(ch["id"]), "✅ Channel Added\n\n")
+        else:
+            sessions[uid] = {"action": "add", "step": "link", "data": {"chat": str(chat.id)}}
+            await bot.send_message(chat_id, "This channel is private. Send its invite link (https://t.me/+...).",
+                                   reply_markup=cancel_markup())
         return
 
-    # 5) #notes
-    if text.startswith("#"):
-        name = text[1:].split()[0].lower() if len(text) > 1 else ""
-        if name in doc["notes"]:
-            await say(m, esc(doc["notes"][name]))
-            return
+    await q.answer()
 
-    # 6) filters
-    low = text.lower()
-    for fl in doc["filters"]:
-        if re.search(r"(?<!\w)" + re.escape(fl["k"]) + r"(?!\w)", low):
-            await say(m, render(fl["v"], user, chat))
-            break
+    if kind == "m":
+        if arg == "main":
+            await show(q, main_panel())
+        elif arg == "close":
+            try:
+                await q.edit_message_reply_markup(reply_markup=None)
+            except BadRequest:
+                pass
+        elif arg == "groups":
+            await show(q, await groups_panel(bot))
+        elif arg == "addg":
+            sessions[uid] = {"action": "addg"}
+            await bot.send_message(
+                chat_id,
+                "➕ <b>Add Group</b>\n\nSend the group ID (-100...), @username or t.me link.\n"
+                "💡 Easier: add the bot to the group as admin and I will send you an Add button.",
+                parse_mode="HTML", reply_markup=cancel_markup())
+        return
+
+    if kind == "g":
+        await show(q, await group_panel(bot, arg))
+        return
+    if kind == "gt":
+        if arg in db.groups:
+            db.groups[arg]["gate"] = not db.groups[arg].get("gate", True)
+            db.save()
+        await show(q, await group_panel(bot, arg))
+        return
+    if kind == "ge":
+        if arg in db.groups:
+            sessions[uid] = {"action": "editg", "gid": arg}
+            await bot.send_message(chat_id, "✏️ Send the NEW group ID (-100...), @username or t.me link.",
+                                   reply_markup=cancel_markup())
+        return
+    if kind == "gd":
+        g = db.groups.get(arg)
+        if g:
+            m = InlineKeyboardMarkup([[btn("✅ Yes, Delete", data=f"gdy:{arg}", style="danger"),
+                                       btn("⬅️ Cancel", data=f"g:{arg}")]])
+            await show(q, (f"🗑 <b>Remove {escape(g['title'])} from your list?</b>", m))
+        return
+    if kind == "gdy":
+        db.groups.pop(arg, None)
+        db.save()
+        await show(q, await groups_panel(bot), "🗑 Removed\n\n")
+        return
+
+    if kind == "a":
+        if arg == "chs":
+            await show(q, channels_panel())
+        elif arg == "v":
+            await show(q, verify_panel())
+        elif arg == "vcol":
+            await show(q, color_panel())
+        elif arg == "vico":
+            db.settings["verify_icon"] = ""
+            db.save()
+            await show(q, verify_panel(), "✅ Updated\n\n")
+        elif arg == "delmsg":
+            db.settings["delete_msg"] = not db.settings["delete_msg"]
+            db.save()
+            await show(q, main_panel())
+        elif arg == "vtxt":
+            sessions[uid] = {"action": "vtxt"}
+            await bot.send_message(
+                chat_id,
+                "✏️ Send the new VERIFY button text.\n💎 You can also send a message with a premium emoji. "
+                "It will be used on the button.", reply_markup=cancel_markup())
+        elif arg == "chadd":
+            if len(db.settings["channels"]) >= MAX_CHANNELS:
+                await bot.send_message(chat_id, f"❌ Maximum {MAX_CHANNELS} channels allowed.")
+                return
+            sessions[uid] = {"action": "add", "step": "link", "data": {}}
+            await bot.send_message(
+                chat_id,
+                "➕ <b>Add Channel</b>\n\nStep 1/2: send the channel join link (https://t.me/...).\n"
+                "Button name and colour are automatic.\n"
+                "💡 Or just add the bot to the channel as admin and tap the button I send you.",
+                parse_mode="HTML", reply_markup=cancel_markup())
+        return
+
+    if kind == "c":
+        await show(q, channel_panel(arg))
+        return
+    if kind == "cd":
+        m = InlineKeyboardMarkup([[btn("✅ Yes, Delete", data=f"cdy:{arg}", style="danger"),
+                                   btn("⬅️ Cancel", data=f"c:{arg}")]])
+        await show(q, ("🗑 <b>Delete this channel button?</b>", m))
+        return
+    if kind == "cdy":
+        db.settings["channels"] = [c for c in db.settings["channels"] if c["id"] != arg]
+        db.save()
+        joined_cache.clear()
+        await show(q, channels_panel(), "🗑 Deleted\n\n")
+        return
+    if kind == "col" and arg == "verify":
+        style = COLOR_CODES.get(arg2)
+        if style:
+            db.settings["verify_color"] = style
+            db.save()
+            await show(q, verify_panel(), "✅ Colour Updated\n\n")
+
+
+# ----------------------------------------------------------------- owner: typed values (wizards)
+def extract_custom_emoji(m):
+    """(text without premium emojis, first premium emoji id or ''). Offsets are UTF-16 units."""
+    text = m.text or ""
+    ents = [e for e in (m.entities or []) if e.type == "custom_emoji" and getattr(e, "custom_emoji_id", None)]
+    if not ents:
+        return text.strip(), ""
+    raw = text.encode("utf-16-le")
+    out, pos = bytearray(), 0
+    for s_, e_ in sorted((e.offset * 2, (e.offset + e.length) * 2) for e in ents):
+        out += raw[pos:s_]
+        pos = e_
+    out += raw[pos:]
+    cleaned = re.sub(r"[ \t]{2,}", " ", out.decode("utf-16-le")).strip()
+    return cleaned, str(ents[0].custom_emoji_id)
+
+
+async def handle_session(update: Update, context: ContextTypes.DEFAULT_TYPE, sess):
+    m, bot = update.effective_message, context.bot
+    uid, chat_id = update.effective_user.id, m.chat_id
+    action = sess["action"]
+    value = (m.text or "").strip()
+
+    def done():
+        sessions.pop(uid, None)
+
+    if action in ("addg", "editg"):
+        try:
+            chat = await chat_from_message(bot, m)
+            if chat.type == ChatType.CHANNEL:
+                raise ValueError("is_channel")
+            if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+                raise ValueError("not_group")
+        except Exception as e:
+            await m.reply_text(err_text(e), parse_mode="HTML")
+            return
+        done()
+        if action == "addg":
+            new = save_group(chat)
+            await send_panel(bot, chat_id, await group_panel(bot, str(chat.id)),
+                             "✅ Group Added\n\n" if new else "♻️ Already in list\n\n")
+        else:
+            replace_group(sess["gid"], chat)
+            await send_panel(bot, chat_id, await group_panel(bot, str(chat.id)), "✏️ Group Updated\n\n")
+        return
+
+    if action == "vtxt":
+        icon = ""
+        value, icon = extract_custom_emoji(m)
+        if not value or len(value) > 64:
+            await m.reply_text("❌ Button text must be between 1 and 64 characters.")
+            return
+        db.settings["verify_text"] = value
+        db.settings["verify_icon"] = icon
+        db.save()
+        done()
+        await send_panel(bot, chat_id, verify_panel(), "✅ Updated\n\n")
+        return
+
+    if action == "add":
+        d = sess["data"]
+        step = sess["step"]
+        if step == "link":
+            fo = getattr(m, "forward_origin", None)
+            fch = (getattr(fo, "chat", None) or getattr(fo, "sender_chat", None)) if fo else None
+            if fch is not None and getattr(fch, "username", None):
+                value = f"https://t.me/{fch.username}"
+            if not valid_link(value):
+                await m.reply_text("❌ Invalid link. Use https://, http:// or tg://.")
+                return
+            d["link"] = value
+            if d.get("chat"):                      # id already known (from notification)
+                ch = new_channel(value, d["chat"])
+                done()
+                await send_panel(bot, chat_id, channel_panel(ch["id"]), "✅ Channel Added\n\n")
+                return
+            derived = derive_chat_from_link(value)
+            if derived:
+                ok, err = await check_bot_access(bot, derived)
+                if ok:
+                    ch = new_channel(value, derived)
+                    done()
+                    await send_panel(bot, chat_id, channel_panel(ch["id"]), "✅ Channel Added\n\n")
+                    return
+                sess["step"] = "chat"
+                await bot.send_message(chat_id, "❌ " + err, reply_markup=cancel_markup())
+                return
+            sess["step"] = "chat"
+            await bot.send_message(
+                chat_id,
+                "Step 2/2: this is a private/invite link, so send the channel numeric ID (-100...) "
+                "or @username.\n💡 You can also forward any post from that channel.\n"
+                "Bot must be admin in the channel.", reply_markup=cancel_markup())
+        elif step == "chat":
+            fo = getattr(m, "forward_origin", None)
+            fch = (getattr(fo, "chat", None) or getattr(fo, "sender_chat", None)) if fo else None
+            chat = str(fch.id) if fch is not None else normalize_chat(value)
+            if not chat:
+                await m.reply_text("❌ Send a valid @username or numeric ID (-100...).")
+                return
+            ok, err = await check_bot_access(bot, chat)
+            if not ok:
+                await m.reply_text("❌ " + err)
+                return
+            ch = new_channel(d["link"], chat)
+            done()
+            await send_panel(bot, chat_id, channel_panel(ch["id"]), "✅ Channel Added\n\n")
+
+
+async def on_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    m, u = update.effective_message, update.effective_user
+    if not m or not u:
+        return
+    if OWNER_ID == 0:
+        await m.reply_text("OWNER_ID is not set. Add it in the Render Environment and redeploy.")
+        return
+    if u.id != OWNER_ID:
+        await m.reply_text("🔒 This is a private bot.")
+        return
+    text = m.text or ""
+    sess = sessions.get(u.id)
+    if sess and not text.startswith("/"):
+        await handle_session(update, context, sess)
+        return
+    sessions.pop(u.id, None)
+    t, markup = main_panel()
+    await say(m, t, reply_markup=markup)
+
+
+# ----------------------------------------------------------------- bot added / removed
+async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ev = update.my_chat_member
+    if not ev or OWNER_ID == 0:
+        return
+    chat = ev.chat
+    if chat.type == ChatType.PRIVATE:
+        return
+    old, new = ev.old_chat_member.status, ev.new_chat_member.status
+    gone = ("left", "kicked")
+    _bot_admin_cache.pop(chat.id, None)
+    try:
+        if old in gone and new not in gone:
+            if chat.type == ChatType.CHANNEL:
+                kb = InlineKeyboardMarkup([[btn("📢 Add as Required Channel", data=f"rch:{chat.id}", style="primary")]])
+                what = "channel"
+                ask = "Add it as a required channel?"
+            else:
+                if str(chat.id) in db.groups:
+                    save_group(chat)
+                    await context.bot.send_message(OWNER_ID, f"ℹ️ Bot is back in <b>{escape(chat.title)}</b> "
+                                                   "(already in your list).", parse_mode="HTML")
+                    return
+                kb = InlineKeyboardMarkup([[btn("➕ Add to My Groups", data=f"add:{chat.id}", style="success")]])
+                what = "group"
+                ask = "Add it to your groups list?"
+            await context.bot.send_message(
+                OWNER_ID, f"➕ Bot was added to <b>{escape(chat.title)}</b> [{what}]\n<code>{chat.id}</code>\n\n{ask}\n"
+                          "(Make the bot admin first.)", parse_mode="HTML", reply_markup=kb)
+        elif new in gone and str(chat.id) in db.groups:
+            await context.bot.send_message(
+                OWNER_ID, f"⚠️ Bot was removed from <b>{escape(chat.title)}</b>. It is still in your list.",
+                parse_mode="HTML")
+    except Exception:
+        log.exception("owner notification failed")
 
 
 async def on_error(update, context):
@@ -1207,46 +997,24 @@ class Ping(BaseHTTPRequestHandler):
 
 
 def run_web():
-    port = int(os.getenv("PORT", "8080"))
-    HTTPServer(("0.0.0.0", port), Ping).serve_forever()
+    HTTPServer(("0.0.0.0", int(os.getenv("PORT", "8080"))), Ping).serve_forever()
 
 
-# ----------------------------------------------------------------- run
 def main():
     token = os.getenv("BOT_TOKEN", "").strip()
     if not token:
-        sys.exit("BOT_TOKEN set nahi hai! (.env ya Render Environment me daalo)")
+        sys.exit("BOT_TOKEN is not set (add it in Render Environment).")
     threading.Thread(target=run_web, daemon=True).start()
-    log.info("Storage: %s", "MongoDB" if store.uri else "local data.json")
 
     asyncio.set_event_loop(asyncio.new_event_loop())   # Python 3.14 fix
-    app = Application.builder().token(token).build()
-    C = lambda name, fn: app.add_handler(CommandHandler(name, fn))
-    for name, fn in [
-        ("start", start), ("help", help_cmd), ("ping", ping), ("id", id_cmd), ("whois", whois),
-        ("admins", admins), ("ban", ban), ("unban", unban), ("kick", kick), ("mute", mute),
-        ("unmute", unmute), ("warn", warn), ("unwarn", unwarn), ("warns", warns_cmd),
-        ("resetwarns", resetwarns), ("setwarnlimit", setwarnlimit), ("del", del_cmd),
-        ("purge", purge), ("pin", pin), ("unpin", unpin),
-        ("setwelcome", setwelcome), ("welcome", welcome_toggle),
-        ("setgoodbye", setgoodbye), ("goodbye", goodbye_toggle),
-        ("rules", rules), ("setrules", setrules), ("clearrules", clearrules),
-        ("save", save), ("get", get_note), ("notes", notes_cmd), ("clear", clear_note),
-        ("filter", filter_cmd), ("stop", stop_filter), ("filters", filters_cmd),
-        ("addblacklist", addbl), ("unblacklist", rmbl), ("blacklist", bl_list),
-        ("lock", lock_cmd), ("unlock", unlock_cmd), ("locks", locks_cmd), ("setflood", setflood),
-        ("setformat", setformat), ("setwrong", setwrong), ("addcmd", addcmd), ("delcmd", delcmd),
-        ("setcmds", setcmds), ("clearcmds", clearcmds), ("cmds", cmds_cmd),
-        ("setrange", setrange), ("formatmode", formatmode), ("formatadmin", formatadmin),
-        ("formatdelete", formatdelete), ("formatautodel", formatautodel),
-        ("formatstatus", formatstatus),
-    ]:
-        C(name, fn)
-    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_join))
-    app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, on_leave))
-    app.add_handler(MessageHandler(~filters.COMMAND & ~filters.StatusUpdate.ALL, watcher), group=1)
+    app = Application.builder().bot(StyledBot(token)).build()
+    app.add_handler(CallbackQueryHandler(on_verify, pattern=r"^v:"))
+    app.add_handler(CallbackQueryHandler(on_owner_button, pattern=r"^(m|g|gt|ge|gd|gdy|a|c|cd|cdy|col|add|rch)(:|$)"))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE, on_private_message))
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.StatusUpdate.ALL, gate_watch), group=1)
+    app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_error_handler(on_error)
-    log.info("Bot starting...")
+    log.info("Bot starting... groups: %d, required channels: %d", len(db.groups), len(db.settings["channels"]))
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
