@@ -464,19 +464,30 @@ async def gate_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
     except Exception:
         pass
+    # Keep one visible join prompt per user. Replace the previous prompt so a fresh
+    # prompt is shown after every blocked message instead of silently throttling it.
+    key = (chat.id, user.id)
+    old = prompts.get(key)
+    if old:
+        try:
+            await context.bot.delete_message(chat_id=chat.id, message_id=old[0])
+        except Exception:
+            pass
+        prompts.pop(key, None)
+
+    # Send the join prompt first, then delete the user's message. This makes the
+    # prompt attempt independent from whether deleting the incoming message succeeds.
+    try:
+        sent = await send_join_prompt(context.bot, chat.id, g, user, missing, missing_groups)
+        prompts[key] = (sent.message_id, time.time())
+    except Exception:
+        log.exception("could not send join prompt to chat %s for user %s", chat.id, user.id)
+
     if g["delete_msg"]:
         try:
             await m.delete()
         except Exception:
-            pass
-    old = prompts.get((chat.id, user.id))
-    if old and time.time() - old[1] < PROMPT_SECONDS:
-        return        # this user already has a join message waiting
-    try:
-        sent = await send_join_prompt(context.bot, chat.id, g, user, missing, missing_groups)
-        prompts[(chat.id, user.id)] = (sent.message_id, time.time())
-    except Exception:
-        log.exception("could not send join prompt")
+            log.exception("could not delete blocked message in chat %s", chat.id)
 
 
 async def on_verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
